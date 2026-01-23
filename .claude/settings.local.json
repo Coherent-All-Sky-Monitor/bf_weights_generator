@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(/home/casm/software/vishnu/venv/bf_weights_generator/bin/pytest:*)",
+      "Bash(/home/casm/software/vishnu/venv/bf_weights_generator/bin/python:*)"
+    ]
+  }
+}

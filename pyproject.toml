@@ -1,0 +1,83 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bf_weights_generator"
+version = "0.1.0"
+description = "Geometric beamformer weights calculator for the CASM array at OVRO"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+authors = [
+    {name = "CASM Team"},
+]
+keywords = [
+    "radio astronomy",
+    "beamforming",
+    "CASM",
+    "OVRO",
+    "interferometry",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Astronomy",
+]
+
+dependencies = [
+    "numpy>=1.20.0",
+]
+
+[project.optional-dependencies]
+full = [
+    "astropy>=5.0",
+    "h5py>=3.0",
+]
+astropy = [
+    "astropy>=5.0",
+]
+hdf5 = [
+    "h5py>=3.0",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+    "black",
+    "isort",
+    "mypy",
+]
+
+[project.scripts]
+bf-weights = "bf_weights_generator.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/casm-team/bf_weights_generator"
+Documentation = "https://github.com/casm-team/bf_weights_generator"
+Repository = "https://github.com/casm-team/bf_weights_generator"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["bf_weights_generator*"]
+
+[tool.black]
+line-length = 100
+target-version = ['py38', 'py39', 'py310', 'py311']
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
