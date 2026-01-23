@@ -240,10 +240,7 @@ Observatory: 37.2339°N, 118.2820°W, 1222m (OVRO)
 
 ## Beam Spacing
 
-Default 4° spacing is appropriate for the current 13-antenna configuration:
-- Beam FWHM ≈ λ/D ≈ 0.75m / 10m ≈ 4° at 400 MHz
-
-Adjust `spacing_deg` based on your array size and desired overlap.
+Adjust `spacing_deg` based on your array size and desired overlap. Default is `4 deg`.
 
 ## Running Tests
 
