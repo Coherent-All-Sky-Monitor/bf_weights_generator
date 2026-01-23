@@ -1,6 +1,6 @@
 # Claude agent files
 CLAUDE.md
-
+.claude/
 # Python
 __pycache__/
 *.py[cod]
