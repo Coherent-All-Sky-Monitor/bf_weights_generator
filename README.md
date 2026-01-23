@@ -1,6 +1,6 @@
 # CASM Geometric Beamformer Weights Generator
 
-A Python package for computing geometric beamformer weights for the CASM (Caltech All-Sky Monitor) array at OVRO (Owens Valley Radio Observatory).
+A Python package for computing geometric beamformer weights for the CASM (Coherent All-Sky Monitor) array at OVRO (Owens Valley Radio Observatory).
 
 ## Features
 
