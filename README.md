@@ -121,6 +121,27 @@ pointings = [
 weights = bf.compute_stationary_weights(pointings, mode='coherent')
 ```
 
+### Single stationary beam at specific Alt/Az
+
+```python
+from bf_weights_generator import StationaryPointing, GeometricBeamformer
+
+bf = GeometricBeamformer()
+
+# Zenith beam
+zenith = StationaryPointing(alt_deg=90.0, az_deg=0.0, name="Zenith")
+weights = bf.compute_stationary_weights([zenith], mode='coherent')
+print(f"Shape: {weights.weights.shape}")  # (1, 13, 3072)
+
+# South at 60° altitude
+south60 = StationaryPointing(alt_deg=60.0, az_deg=180.0, name="South60")
+weights = bf.compute_stationary_weights([south60], mode='coherent')
+
+# Get the geometric delays
+delays = bf.compute_stationary_delays(zenith)
+print(f"Delays (ns): {delays * 1e9}")
+```
+
 ### Stationary incoherent beams
 
 ```python
@@ -195,11 +216,17 @@ bf = GeometricBeamformer(freq_config=freq)
 
 ## File I/O
 
+### Python API
+
 ```python
 from bf_weights_generator import save_weights_hdf5, load_weights_hdf5, inspect_weights_file
 
-# Save
+# Save to HDF5
 save_weights_hdf5(weights, "weights.h5", compression_opts=4)
+
+# Save to NPZ
+from bf_weights_generator import save_weights_npz
+save_weights_npz(weights, "weights.npz")
 
 # Inspect without loading
 info = inspect_weights_file("weights.h5")
@@ -208,6 +235,89 @@ print(f"Shape: {info['weights_shape']}")
 
 # Load
 weights = load_weights_hdf5("weights.h5")
+```
+
+### Command-Line: Dump Stationary Weights
+
+Use `examples/dump_stationary_weights.py` to generate and save stationary beam weights:
+
+```bash
+# Single beam at zenith (HDF5 format)
+python examples/dump_stationary_weights.py --alt 90 --az 0 --name Zenith -o zenith.h5
+
+# Single beam at zenith (NPZ format)
+python examples/dump_stationary_weights.py --alt 90 --az 0 --name Zenith -o zenith.npz
+
+# Beam pointing South at 60° altitude
+python examples/dump_stationary_weights.py --alt 60 --az 180 --name South60 -o south60.h5
+
+# Incoherent weights (unity)
+python examples/dump_stationary_weights.py --alt 90 --az 0 --mode incoherent -o incoh.h5
+
+# Generate a grid of beams (19 beams)
+python examples/dump_stationary_weights.py --grid -o beam_grid.h5
+
+# Custom grid parameters
+python examples/dump_stationary_weights.py --grid --alt-min 45 --alt-max 90 --alt-step 15 --az-step 30 -o grid.h5
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--alt` | Altitude in degrees (0=horizon, 90=zenith) |
+| `--az` | Azimuth in degrees (0=North, 90=East, 180=South) |
+| `--name` | Beam name for metadata |
+| `--mode` | `coherent` (default) or `incoherent` |
+| `--grid` | Generate multiple beams in a grid |
+| `-o` | Output file (.h5 for HDF5, .npz for NumPy) |
+
+### Command-Line: Read and Inspect Weights Files
+
+Use `examples/read_weights_file.py` to inspect saved weight files:
+
+```bash
+# Read HDF5 file
+python examples/read_weights_file.py zenith.h5
+
+# Read NPZ file
+python examples/read_weights_file.py zenith.npz
+
+# Verbose mode (show sample weight values)
+python examples/read_weights_file.py zenith.h5 --verbose
+```
+
+**Example output:**
+```
+weights:
+  Shape: (1, 7, 3072)
+  Dtype: complex64
+  Size: 0.17 MB
+  -> (n_beams=1, n_ant=7, n_chan=3072)
+
+frequencies_hz:
+  Shape: (3072,)
+  Range: 468.73 - 375.02 MHz
+
+Pointings (stationary beam):
+  Beam 0: Alt=90.0°, Az=0.0°
+```
+
+### Command-Line: Compute Delays for DADA Files
+
+Use `examples/compute_delays_for_dada.py` for working with voltage data:
+
+```bash
+# Compute tracking delays for Cas A
+python examples/compute_delays_for_dada.py --source casa --time "2026-01-21T01:16:44"
+
+# Compute stationary delays at Alt/Az
+python examples/compute_delays_for_dada.py --alt 60 --az 180 --name South60
+
+# Process a DADA file with coherent beamforming
+python examples/compute_delays_for_dada.py --dada /path/to/file.dada --source casa
+
+# Save delays to file
+python examples/compute_delays_for_dada.py --source cyga --output delays.npz
 ```
 
 ## HDF5 File Structure
@@ -242,12 +352,29 @@ Observatory: 37.2339°N, 118.2820°W, 1222m (OVRO)
 
 Adjust `spacing_deg` based on your array size and desired overlap. Default is `4 deg`.
 
+## Example Scripts
+
+The `examples/` directory contains ready-to-use scripts:
+
+| Script | Description |
+|--------|-------------|
+| `basic_usage.py` | Python API examples for all beamforming modes |
+| `dump_stationary_weights.py` | CLI to generate and save stationary beam weights |
+| `read_weights_file.py` | CLI to inspect saved HDF5/NPZ weight files |
+| `compute_delays_for_dada.py` | CLI for computing delays and processing DADA voltage files |
+| `generate_example_weights.py` | Generate example weights for all 4 beamforming modes |
+
 ## Running Tests
 
 ```bash
 pip install pytest
 pytest tests/ -v
 ```
+
+## TODO
+
+- [ ] Cable delay calibration pipeline (in progress, see `tests/calibrate_cable_delays.py`)
+- [ ] Validate calibration with bright source observations
 
 ## License
 
