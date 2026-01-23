@@ -242,20 +242,11 @@ weights = load_weights_hdf5("weights.h5")
 Use `examples/dump_stationary_weights.py` to generate and save stationary beam weights:
 
 ```bash
-# Single beam at zenith (HDF5 format)
+# Single beam at zenith (HDF5/NPZ format)
 python examples/dump_stationary_weights.py --alt 90 --az 0 --name Zenith -o zenith.h5
-
-# Single beam at zenith (NPZ format)
-python examples/dump_stationary_weights.py --alt 90 --az 0 --name Zenith -o zenith.npz
-
-# Beam pointing South at 60° altitude
-python examples/dump_stationary_weights.py --alt 60 --az 180 --name South60 -o south60.h5
 
 # Incoherent weights (unity)
 python examples/dump_stationary_weights.py --alt 90 --az 0 --mode incoherent -o incoh.h5
-
-# Generate a grid of beams (19 beams)
-python examples/dump_stationary_weights.py --grid -o beam_grid.h5
 
 # Custom grid parameters
 python examples/dump_stationary_weights.py --grid --alt-min 45 --alt-max 90 --alt-step 15 --az-step 30 -o grid.h5
@@ -312,9 +303,6 @@ python examples/compute_delays_for_dada.py --source casa --time "2026-01-21T01:1
 
 # Compute stationary delays at Alt/Az
 python examples/compute_delays_for_dada.py --alt 60 --az 180 --name South60
-
-# Process a DADA file with coherent beamforming
-python examples/compute_delays_for_dada.py --dada /path/to/file.dada --source casa
 
 # Save delays to file
 python examples/compute_delays_for_dada.py --source cyga --output delays.npz
