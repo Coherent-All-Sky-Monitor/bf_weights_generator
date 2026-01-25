@@ -72,11 +72,7 @@ save_weights_hdf5(tracking, "tracking_weights.h5")
 | Pointing frame | Alt/Az (local horizon) | RA/Dec (celestial) |
 | Weights | Time-independent | Time-dependent |
 | Weight shape | `(n_beams, n_ant, n_chan)` | `(n_beams, n_times, n_ant, n_chan)` |
-| Use case | FRB transit search | Pulsar timing, source monitoring |
 
-**Stationary beams** are fixed in the local sky. As Earth rotates, different celestial sources drift through the beams. Weights are computed once and applied continuously.
-
-**Tracking beams** follow celestial sources. As Earth rotates, the beam direction changes in the local frame, requiring weight updates at each time step.
 
 ### Coherent vs Incoherent
 
@@ -84,7 +80,7 @@ save_weights_hdf5(tracking, "tracking_weights.h5")
 |----------|----------|------------|
 | Phase steering | Yes: `w = exp(-2πi·f·τ)` | No: weights are unity |
 | Output | `beam = \|W·v\|²` | `beam = v*·v = \|v\|²` |
-| Use case | Directional sensitivity | Total power |
+| Sensitivity | Scales as N antennas | Scales as sqrt(N) |
 
 ## Stationary Beam Examples
 
@@ -334,7 +330,6 @@ python examples/compute_delays_for_dada.py --source cyga --output delays.npz
 | 6-11    | 0.0-2.03 | -10.5     | 0.0    |
 | 12      | -4.553   | -5.5      | -0.279 |
 
-Observatory: 37.2339°N, 118.2820°W, 1222m (OVRO)
 
 ## Beam Spacing
 
