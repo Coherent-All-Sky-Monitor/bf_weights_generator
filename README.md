@@ -48,7 +48,7 @@ pointings = generate_beam_grid_altaz(spacing_deg=4.0)
 stationary = bf.compute_stationary_weights(pointings, mode='coherent')
 # Shape: (n_beams, n_ant, n_chan) - NO time axis
 
-# === TRACKING BEAMS (Source Monitoring) ===
+# === TRACKING BEAMS (Source Monitoring) ==
 # Follow RA/Dec, time-dependent weights
 cyg_a = PhaseCenter(ra_deg=299.868, dec_deg=40.734, name="CygA")
 tracking = bf.compute_tracking_weights(
@@ -165,22 +165,6 @@ weights = bf.compute_tracking_weights(
 print(f"Shape: {weights.shape}")  # (1, 360, 13, 3072)
 ```
 
-### Multiple tracking beams
-
-```python
-sources = [
-    PhaseCenter(ra_deg=299.868, dec_deg=40.734, name="CygA"),
-    PhaseCenter(ra_deg=83.633, dec_deg=22.015, name="TauA"),
-    PhaseCenter.from_hms_dms("05:34:31.9", "+22:00:52", name="Crab"),
-]
-
-weights = bf.compute_tracking_weights(
-    phase_centers=sources,
-    start_time=start_time,
-    duration_sec=3600,
-    cadence_sec=10.0
-)
-```
 
 ## Configuration
 
