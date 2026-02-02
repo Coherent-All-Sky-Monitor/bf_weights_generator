@@ -162,7 +162,6 @@ Your antenna layout CSV needs these columns:
 | 3 | Beams |
 | 4 | Antennas (SNAP input order) |
 
-**Quantization:** `int8_value = round(complex_weight * 127)`
 
 ## Running Tests
 
