@@ -227,7 +227,7 @@ def main():
     # Configuration
     # =========================================================================
     dada_file = "/data/casm/voltage_dumps/2026-01-21-01:16:44_0000000000000000.000000.dada"
-    n_time_samples = 8192  # Use fewer samples for quick testing
+    n_time_samples = 131072  # Use fewer samples for quick testing
 
     print("=" * 70)
     print("CASM Beamformer Test with Voltage Data")

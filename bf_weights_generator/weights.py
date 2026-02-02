@@ -221,7 +221,7 @@ def generate_beam_grid_altaz(
 
     Notes
     -----
-    The default spacing of 4° is appropriate for CASM's current configuration
+    The default spacing of 4° is based on CASM's current configuration
     (~13 antennas, ~10m baseline). Adjust based on your array's beam size:
         beam_FWHM ≈ λ/D ≈ 0.75m / 10m ≈ 4° at 400 MHz
     """
