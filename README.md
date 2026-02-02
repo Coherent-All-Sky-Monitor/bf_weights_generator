@@ -67,6 +67,26 @@ weights = gen.compute_int8_weights(beams)
 save_int8_weights_hdf5(weights, "weights.h5")
 ```
 
+## Standard Stationary Weights (13 antennas)
+
+For the default 13-antenna array without SNAP reordering:
+
+```python
+from bf_weights_generator import (
+    GeometricBeamformer, StationaryPointing, save_weights_hdf5
+)
+
+bf = GeometricBeamformer()
+
+pointings = [
+    StationaryPointing(alt_deg=90.0, az_deg=0.0, name="zenith"),
+    StationaryPointing(alt_deg=60.0, az_deg=45.0, name="ne60"),
+]
+
+weights = bf.compute_stationary_weights(pointings)  # (n_beams, 13, 3072)
+save_weights_hdf5(weights, "weights.h5")
+```
+
 ## Reading Weight Files
 
 ```python
