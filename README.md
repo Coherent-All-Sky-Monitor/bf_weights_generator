@@ -45,7 +45,6 @@ python examples/generate_snap_weights.py \
     --beams transit
 ```
 
-### Python API
 
 ```python
 from bf_weights_generator import (
