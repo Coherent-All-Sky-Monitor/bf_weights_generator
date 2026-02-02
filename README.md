@@ -94,19 +94,21 @@ from bf_weights_generator import load_int8_weights_hdf5
 
 weights = load_int8_weights_hdf5("weights.h5")
 
-# Int8 data: shape (2, 3072, 2, n_beams, 64)
-# Axes: [real/imag, channel, pol, beam, antenna]
-data = weights.weights_int8
-
-# Convert to complex
-complex_weights = weights.to_complex64()  # (n_beams, 64, n_chan)
-
-# List beam pointings
-for i, p in enumerate(weights.pointings):
-    print(f"Beam {i}: Alt={p.alt_deg:.1f}°, Az={p.az_deg:.1f}°")
-
-# Frequencies (Hz)
-freqs = weights.frequencies_hz
+# Available attributes:
+weights.weights_int8      # (2, n_chan, 2, n_beams, 64) - raw int8 data
+weights.to_complex64()    # (n_beams, 64, n_chan) - complex64 conversion
+weights.frequencies_hz    # (n_chan,) - channel frequencies
+weights.pointings         # List[StationaryPointing] - beam directions
+weights.n_beams           # int - number of beams
+weights.n_channels        # int - number of channels
+weights.scale_factor      # float - quantization scale (127.0)
+weights.shape             # tuple - weights_int8 shape
+weights.freq_config       # FrequencyConfig object
+weights.array_config      # Array64Config with:
+#   .positions_enu        # (64, 3) - antenna positions
+#   .active_mask          # (64,) bool - which slots active
+#   .snap_to_ant64        # (64,) int - SNAP input to ant64 mapping
+#   .n_active             # int - number of active antennas
 ```
 
 ## Plotting Beams
@@ -123,20 +125,7 @@ python examples/plot_beams.py --weights weights.h5 --output beams.png
 | Fixed spacing | `generate_beam_grid(spacing_deg=20.0)` |
 | Altitude limits | `generate_beam_grid(n_beams=8, alt_min_deg=45.0)` |
 
-## Transit Survey Beams
 
-The preset `transit` pattern provides 8 beams for FRB detection:
-
-| Beam | Alt | Az | Position |
-|------|-----|-----|----------|
-| 0 | 90° | 0° | Zenith |
-| 1 | 70° | 0° | North |
-| 2 | 70° | 90° | East |
-| 3 | 70° | 180° | South |
-| 4 | 70° | 270° | West |
-| 5 | 50° | 45° | NE |
-| 6 | 50° | 135° | SE |
-| 7 | 50° | 225° | SW |
 
 ## CSV Layout Format
 
