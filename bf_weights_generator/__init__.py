@@ -110,6 +110,19 @@ from .io import (
     save_weights_npz,
     load_weights_npz,
     inspect_weights_file,
+    save_int8_weights_hdf5,
+    load_int8_weights_hdf5,
+    inspect_int8_weights_file,
+)
+
+# SNAP 64-antenna weights
+from .snap_weights import (
+    Array64Config,
+    SnapWeightsGenerator,
+    Int8StationaryWeights,
+    TRANSIT_SURVEY_BEAMS,
+    parse_beams_arg,
+    generate_beam_grid,
 )
 
 __all__ = [
@@ -147,4 +160,14 @@ __all__ = [
     "save_weights_npz",
     "load_weights_npz",
     "inspect_weights_file",
+    "save_int8_weights_hdf5",
+    "load_int8_weights_hdf5",
+    "inspect_int8_weights_file",
+    # SNAP 64-antenna weights
+    "Array64Config",
+    "SnapWeightsGenerator",
+    "Int8StationaryWeights",
+    "TRANSIT_SURVEY_BEAMS",
+    "parse_beams_arg",
+    "generate_beam_grid",
 ]

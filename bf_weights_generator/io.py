@@ -27,6 +27,12 @@ from .weights import (
 )
 from .config import ArrayConfig, FrequencyConfig
 
+# Import Int8StationaryWeights and Array64Config lazily to avoid circular imports
+def _get_snap_weights_classes():
+    """Lazy import of snap_weights module classes."""
+    from .snap_weights import Int8StationaryWeights, Array64Config
+    return Int8StationaryWeights, Array64Config
+
 
 def _check_h5py():
     """Raise error if h5py is not available."""
@@ -426,5 +432,211 @@ def inspect_weights_file(filepath: Union[str, Path]) -> dict:
             info['n_times'] = metadata.get('n_times', len(data['unix_times']))
     else:
         raise ValueError(f"Unknown file format: {suffix}")
+
+    return info
+
+
+# =============================================================================
+# Int8 Weights I/O (for SNAP beamformer)
+# =============================================================================
+
+def save_int8_weights_hdf5(
+    weights,  # Int8StationaryWeights - type hint omitted to avoid circular import
+    filepath: Union[str, Path],
+    compression: str = "gzip",
+    compression_opts: int = 4,
+    overwrite: bool = False,
+) -> None:
+    """
+    Save int8-quantized beamformer weights to HDF5 file.
+
+    Parameters
+    ----------
+    weights : Int8StationaryWeights
+        Quantized weights object to save.
+    filepath : str or Path
+        Output file path.
+    compression : str, optional
+        Compression algorithm. Default is "gzip".
+    compression_opts : int, optional
+        Compression level (1-9). Default is 4.
+    overwrite : bool, optional
+        Whether to overwrite existing file. Default is False.
+
+    Notes
+    -----
+    HDF5 structure:
+        /
+        ├── weights_int8          # int8, shape (2, n_chan, 2, n_beams, 64)
+        ├── frequencies_hz        # float64, shape (n_chan,)
+        ├── pointings/
+        │   ├── alt_deg, az_deg   # float, shape (n_beams,)
+        │   └── names             # string attribute
+        ├── array_config/
+        │   ├── positions_enu     # float64, shape (64, 3)
+        │   ├── active_mask       # bool, shape (64,)
+        │   ├── snap_to_ant64     # int, shape (64,)
+        │   └── ant64_to_snap     # int, shape (64,)
+        └── Attributes: scale_factor, n_beams, n_channels, n_pol, n_antennas
+    """
+    _check_h5py()
+
+    filepath = Path(filepath)
+    if filepath.exists() and not overwrite:
+        raise FileExistsError(f"File exists: {filepath}. Use overwrite=True to replace.")
+
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+
+    with h5py.File(filepath, 'w') as f:
+        # Store main data
+        f.create_dataset('weights_int8', data=weights.weights_int8,
+                         compression=compression, compression_opts=compression_opts)
+        f.create_dataset('frequencies_hz', data=weights.frequencies_hz)
+
+        # Store root attributes
+        f.attrs['scale_factor'] = weights.scale_factor
+        f.attrs['n_beams'] = weights.n_beams
+        f.attrs['n_channels'] = weights.n_channels
+        f.attrs['n_pol'] = 2
+        f.attrs['n_antennas'] = 64
+        f.attrs['created_utc'] = datetime.now(timezone.utc).isoformat()
+        f.attrs['version'] = '1.0'
+        f.attrs['format_type'] = 'int8_snap_weights'
+
+        # Store pointings
+        pt_grp = f.create_group('pointings')
+        pt_grp.create_dataset('alt_deg', data=[p.alt_deg for p in weights.pointings])
+        pt_grp.create_dataset('az_deg', data=[p.az_deg for p in weights.pointings])
+        pt_grp.attrs['names'] = json.dumps([p.name for p in weights.pointings])
+
+        # Store array configuration
+        arr_grp = f.create_group('array_config')
+        arr_grp.create_dataset('positions_enu', data=weights.array_config.positions_enu)
+        arr_grp.create_dataset('active_mask', data=weights.array_config.active_mask)
+        arr_grp.create_dataset('snap_to_ant64', data=weights.array_config.snap_to_ant64)
+        arr_grp.create_dataset('ant64_to_snap', data=weights.array_config.ant64_to_snap)
+        arr_grp.attrs['csv_path'] = weights.array_config.csv_path
+        arr_grp.attrs['pos_ids'] = json.dumps(weights.array_config.pos_ids)
+
+        # Store frequency configuration
+        freq_grp = f.create_group('freq_config')
+        freq_grp.attrs['n_chan'] = weights.freq_config.n_chan
+        freq_grp.attrs['total_bw_mhz'] = weights.freq_config.total_bw_mhz
+        freq_grp.attrs['total_n_chan'] = weights.freq_config.total_n_chan
+        freq_grp.attrs['freq_end_voltage_mhz'] = weights.freq_config.freq_end_voltage_mhz
+
+
+def load_int8_weights_hdf5(filepath: Union[str, Path]):
+    """
+    Load int8-quantized beamformer weights from HDF5 file.
+
+    Parameters
+    ----------
+    filepath : str or Path
+        Input file path.
+
+    Returns
+    -------
+    Int8StationaryWeights
+        Loaded quantized weights object.
+    """
+    _check_h5py()
+    Int8StationaryWeights, Array64Config = _get_snap_weights_classes()
+
+    filepath = Path(filepath)
+    if not filepath.exists():
+        raise FileNotFoundError(f"File not found: {filepath}")
+
+    with h5py.File(filepath, 'r') as f:
+        # Load main data
+        weights_int8 = f['weights_int8'][:]
+        frequencies_hz = f['frequencies_hz'][:]
+        scale_factor = float(f.attrs['scale_factor'])
+
+        # Load pointings
+        pt_grp = f['pointings']
+        alt_deg = pt_grp['alt_deg'][:]
+        az_deg = pt_grp['az_deg'][:]
+        names = json.loads(pt_grp.attrs['names'])
+        pointings = [
+            StationaryPointing(alt_deg=alt, az_deg=az, name=name)
+            for alt, az, name in zip(alt_deg, az_deg, names)
+        ]
+
+        # Load array configuration
+        arr_grp = f['array_config']
+        array_config = Array64Config(
+            positions_enu=arr_grp['positions_enu'][:],
+            active_mask=arr_grp['active_mask'][:],
+            snap_to_ant64=arr_grp['snap_to_ant64'][:],
+            ant64_to_snap=arr_grp['ant64_to_snap'][:],
+            pos_ids=json.loads(arr_grp.attrs['pos_ids']),
+            csv_path=arr_grp.attrs['csv_path'],
+        )
+
+        # Load frequency configuration
+        freq_grp = f['freq_config']
+        freq_config = FrequencyConfig(
+            n_chan=int(freq_grp.attrs['n_chan']),
+            total_bw_mhz=float(freq_grp.attrs['total_bw_mhz']),
+            total_n_chan=int(freq_grp.attrs['total_n_chan']),
+            freq_end_voltage_mhz=float(freq_grp.attrs['freq_end_voltage_mhz']),
+        )
+
+        return Int8StationaryWeights(
+            weights_int8=weights_int8,
+            pointings=pointings,
+            frequencies_hz=frequencies_hz,
+            array_config=array_config,
+            freq_config=freq_config,
+            scale_factor=scale_factor,
+        )
+
+
+def inspect_int8_weights_file(filepath: Union[str, Path]) -> dict:
+    """
+    Inspect an int8 weights file without loading the full data.
+
+    Parameters
+    ----------
+    filepath : str or Path
+        Input file path.
+
+    Returns
+    -------
+    dict
+        Dictionary containing file metadata and array shapes.
+    """
+    _check_h5py()
+
+    filepath = Path(filepath)
+    if not filepath.exists():
+        raise FileNotFoundError(f"File not found: {filepath}")
+
+    with h5py.File(filepath, 'r') as f:
+        info = {
+            'format': 'hdf5',
+            'format_type': f.attrs.get('format_type', 'unknown'),
+            'scale_factor': float(f.attrs['scale_factor']),
+            'n_beams': int(f.attrs['n_beams']),
+            'n_channels': int(f.attrs['n_channels']),
+            'n_pol': int(f.attrs['n_pol']),
+            'n_antennas': int(f.attrs['n_antennas']),
+            'created_utc': f.attrs.get('created_utc', 'unknown'),
+            'version': f.attrs.get('version', 'unknown'),
+            'weights_shape': f['weights_int8'].shape,
+            'weights_dtype': str(f['weights_int8'].dtype),
+            'file_size_mb': filepath.stat().st_size / 1e6,
+        }
+
+        # Add array config info
+        arr_grp = f['array_config']
+        info['n_active_antennas'] = int(np.sum(arr_grp['active_mask'][:]))
+        info['csv_path'] = arr_grp.attrs.get('csv_path', 'unknown')
+
+        # Add pointing info
+        pt_grp = f['pointings']
+        names = json.loads(pt_grp.attrs['names'])
+        info['beam_names'] = names
 
     return info
