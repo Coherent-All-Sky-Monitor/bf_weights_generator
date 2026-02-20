@@ -42,7 +42,7 @@ debugging/
 htmlcov/
 .tox/
 .nox/
-
+findings.md
 # Jupyter
 .ipynb_checkpoints/
 

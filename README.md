@@ -110,6 +110,56 @@ weights.array_config      # Array64Config with:
 #   .n_active             # int - number of active antennas
 ```
 
+## Combined Geo + Calibration Weights
+
+```python
+from bf_weights_generator import (
+    Array64Config, generate_combined_weights, load_calibration_weights,
+    save_combined_weights_hdf5, generate_beam_grid,
+)
+
+layout = Array64Config.from_csv("casm_antenna_layout_pre_feb16.csv")
+output = Array64Config.from_csv("casm_antenna_layout_current.csv")
+cal = load_calibration_weights("delay_cal_weights/svd_weights.npz")
+
+result = generate_combined_weights(
+    pointing=generate_beam_grid(n_beams=8, array_config=layout),
+    array_config=layout,
+    cal_weights=cal,
+    output_array_config=output,  # SNAP remap (optional)
+)
+save_combined_weights_hdf5(result, "combined.h5")
+
+# result.weights        -> (8, 64, 3072) complex64, SNAP input order
+# result.flags          -> (3072,) bool, True=good channel
+# result.frequencies_hz -> (3072,) float64
+# result.n_good_channels -> int
+```
+
+```bash
+# CLI equivalent
+python examples/generate_combined_weights.py \
+    --compute-layout casm_antenna_layout_pre_feb16.csv \
+    --output-layout  casm_antenna_layout_current.csv \
+    --cal-weights    delay_cal_weights/svd_weights.npz \
+    --n-beams 8 -o combined.h5
+```
+
+## Reading Combined Weight Files
+
+```python
+from bf_weights_generator import load_combined_weights_hdf5
+
+result = load_combined_weights_hdf5("combined.h5")
+result.weights          # (n_beams, 64, n_chan) complex64
+result.frequencies_hz   # (n_chan,)
+result.flags            # (n_chan,) bool
+result.pointings        # List[StationaryPointing]
+result.freq_order       # "descending" or "ascending"
+result.array_config     # Array64Config (compute layout)
+result.output_array_config  # Array64Config (SNAP ordering)
+```
+
 ## Plotting Beams
 
 ```bash
@@ -160,7 +210,6 @@ pytest tests/ -v
 ## TODO
 
 - Tracking beams (follow RA/Dec sources)
-- Cable delay calibration integration
 
 ## License
 
