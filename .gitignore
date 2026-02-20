@@ -22,20 +22,20 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-
+**/__init__.py
 # Virtual environments
 venv/
 ENV/
 env/
 .venv/
-
+debug.py
 # IDE
 .idea/
 .vscode/
 *.swp
 *.swo
 *~
-
+debugging/
 # Testing
 .pytest_cache/
 .coverage

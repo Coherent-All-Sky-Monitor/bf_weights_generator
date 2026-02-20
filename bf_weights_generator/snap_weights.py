@@ -17,7 +17,7 @@ from typing import List, Optional, Tuple
 from pathlib import Path
 import csv
 
-from .config import ArrayConfig, FrequencyConfig
+from .config import ArrayConfig, FrequencyConfig, compute_beam_fwhm
 from .weights import (
     GeometricBeamformer,
     StationaryPointing,
@@ -405,21 +405,25 @@ def generate_beam_grid(
     alt_max_deg: float = 90.0,
     az_min_deg: float = 0.0,
     az_max_deg: float = 360.0,
+    positions_enu: Optional[np.ndarray] = None,
+    array_config: Optional['Array64Config'] = None,
+    freq_hz: Optional[float] = None,
 ) -> List[StationaryPointing]:
     """
     Generate a grid of beam pointings covering the sky.
 
-    The grid is generated with uniform spacing in altitude, and azimuth
-    spacing adjusted at each altitude to maintain roughly uniform sky coverage
-    (fewer azimuth beams near zenith where the circles are smaller).
+    The grid is generated with spacing in altitude and azimuth adjusted at
+    each altitude to maintain roughly uniform sky coverage. Supports both
+    isotropic and elliptical (array-aware) beam spacing.
 
     Parameters
     ----------
     n_beams : int, optional
-        Target number of beams. If specified, spacing_deg is computed
+        Target number of beams. If specified, spacing is scaled
         automatically to achieve approximately this many beams.
     spacing_deg : float
-        Beam spacing in degrees (default: 15.0). Ignored if n_beams is specified.
+        Isotropic beam spacing in degrees (default: 15.0). Ignored if
+        n_beams is specified or if array positions are provided.
     alt_min_deg : float
         Minimum altitude in degrees (default: 30.0).
     alt_max_deg : float
@@ -428,6 +432,15 @@ def generate_beam_grid(
         Minimum azimuth in degrees (default: 0.0).
     az_max_deg : float
         Maximum azimuth in degrees (default: 360.0).
+    positions_enu : np.ndarray, optional
+        Antenna positions in ENU coordinates, shape (n_ant, 3). If provided,
+        auto-computes elliptical spacing from beam FWHM (lambda/D per axis).
+    array_config : Array64Config, optional
+        Array configuration. If provided, uses its active positions for
+        FWHM computation. Overrides ``positions_enu``.
+    freq_hz : float, optional
+        Reference frequency in Hz for FWHM computation (default: 437.5 MHz).
+        Only used when positions are provided.
 
     Returns
     -------
@@ -439,30 +452,45 @@ def generate_beam_grid(
     >>> beams = generate_beam_grid(n_beams=8)  # ~8 beams
     >>> beams = generate_beam_grid(spacing_deg=20)  # 20 deg spacing
     >>> beams = generate_beam_grid(n_beams=16, alt_min_deg=45)  # 16 beams above 45 deg
+    >>> # Array-aware elliptical spacing:
+    >>> from bf_weights_generator import Array64Config
+    >>> arr = Array64Config.from_csv("layout.csv")
+    >>> beams = generate_beam_grid(array_config=arr)
     """
-    # If n_beams specified, estimate spacing to achieve target count
-    if n_beams is not None:
-        # Approximate: solid angle covered = 2*pi*(1 - cos(90-alt_min))
-        # Each beam covers ~(spacing)^2 steradians
-        # So n_beams ~ solid_angle / beam_area
-        alt_min_rad = np.deg2rad(alt_min_deg)
-        solid_angle = 2 * np.pi * (1 - np.sin(alt_min_rad))  # steradians above alt_min
-        beam_area = (np.deg2rad(spacing_deg)) ** 2
-        estimated_n = solid_angle / beam_area
+    # Determine per-axis spacing from array positions if provided
+    if array_config is not None:
+        pos = array_config.active_positions
+        spacing_ew, spacing_ns = compute_beam_fwhm(pos, freq_hz=freq_hz)
+    elif positions_enu is not None:
+        spacing_ew, spacing_ns = compute_beam_fwhm(positions_enu, freq_hz=freq_hz)
+    else:
+        spacing_ew = spacing_deg
+        spacing_ns = spacing_deg
 
-        # Adjust spacing iteratively to get close to target
-        if n_beams > 1:
-            # Scale spacing to match target
+    # If n_beams specified, estimate scaling to achieve target count
+    if n_beams is not None:
+        alt_min_rad = np.deg2rad(alt_min_deg)
+        alt_max_rad = np.deg2rad(alt_max_deg)
+        solid_angle = 2 * np.pi * (np.sin(alt_max_rad) - np.sin(alt_min_rad))
+        beam_area = np.deg2rad(spacing_ew) * np.deg2rad(spacing_ns)
+        if beam_area > 0:
+            estimated_n = solid_angle / beam_area
+        else:
+            estimated_n = 1
+
+        if n_beams > 1 and estimated_n > 0:
             scale = np.sqrt(estimated_n / n_beams)
-            spacing_deg = spacing_deg * scale
+            spacing_ew = spacing_ew * scale
+            spacing_ns = spacing_ns * scale
             # Clamp to reasonable range
-            spacing_deg = max(5.0, min(60.0, spacing_deg))
+            spacing_ew = max(0.5, min(60.0, spacing_ew))
+            spacing_ns = max(0.5, min(60.0, spacing_ns))
 
     pointings = []
     beam_idx = 0
 
-    # Generate altitude levels
-    alt_values = np.arange(alt_min_deg, alt_max_deg + spacing_deg / 2, spacing_deg)
+    # Generate altitude levels (N-S spacing controls altitude step)
+    alt_values = np.arange(alt_min_deg, alt_max_deg + spacing_ns / 2, spacing_ns)
 
     for alt in alt_values:
         if alt > 90.0:
@@ -475,9 +503,9 @@ def generate_beam_grid(
             az_values = [0.0]
         else:
             # Circumference at this altitude: 2π * cos(alt)
-            # Number of beams: circumference / spacing
+            # Number of beams: circumference / spacing_ew
             cos_alt = np.cos(np.deg2rad(alt))
-            az_spacing = spacing_deg / cos_alt if cos_alt > 0.1 else 360.0
+            az_spacing = spacing_ew / cos_alt if cos_alt > 0.1 else 360.0
 
             # Handle partial azimuth range
             az_range = az_max_deg - az_min_deg

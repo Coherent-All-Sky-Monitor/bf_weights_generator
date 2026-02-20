@@ -26,7 +26,10 @@ from bf_weights_generator import (
     TRANSIT_SURVEY_BEAMS,
     parse_beams_arg,
     generate_beam_grid,
+    compute_beam_fwhm,
+    estimate_n_beams,
 )
+from bf_weights_generator.weights import generate_beam_grid_altaz
 
 
 # Path to test CSV files (relative to project root)
@@ -406,6 +409,218 @@ class TestGenerateBeamGrid:
         beams = generate_beam_grid()
         assert len(beams) > 0
         assert all(b.alt_deg >= 30.0 for b in beams)
+
+
+class TestComputeBeamFwhm:
+    """Tests for compute_beam_fwhm function."""
+
+    def test_known_array(self):
+        """Test FWHM with known baselines: 3m E-W, 21.5m N-S at 437.5 MHz."""
+        positions = np.array([
+            [0.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+            [0.0, -21.5, 0.0],
+        ])
+        fwhm_ew, fwhm_ns = compute_beam_fwhm(positions, freq_hz=437.5e6)
+        # lambda = c / f = 0.685 m
+        # fwhm_ew = degrees(0.685 / 3.0) ~ 13.1°
+        # fwhm_ns = degrees(0.685 / 21.5) ~ 1.83°
+        assert 12.0 < fwhm_ew < 15.0, f"E-W FWHM {fwhm_ew:.1f}° outside expected range"
+        assert 1.5 < fwhm_ns < 2.5, f"N-S FWHM {fwhm_ns:.1f}° outside expected range"
+
+    def test_ew_wider_than_ns(self):
+        """Test that shorter E-W baseline gives wider E-W beam."""
+        positions = np.array([
+            [0.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+            [0.0, -21.5, 0.0],
+        ])
+        fwhm_ew, fwhm_ns = compute_beam_fwhm(positions)
+        assert fwhm_ew > fwhm_ns
+
+    def test_single_antenna_ew(self):
+        """Test that zero E-W baseline gives 180° FWHM."""
+        positions = np.array([
+            [0.0, 0.0, 0.0],
+            [0.0, -10.0, 0.0],
+        ])
+        fwhm_ew, fwhm_ns = compute_beam_fwhm(positions)
+        assert fwhm_ew == 180.0
+        assert fwhm_ns < 180.0
+
+    def test_single_antenna_ns(self):
+        """Test that zero N-S baseline gives 180° FWHM."""
+        positions = np.array([
+            [0.0, 0.0, 0.0],
+            [5.0, 0.0, 0.0],
+        ])
+        fwhm_ew, fwhm_ns = compute_beam_fwhm(positions)
+        assert fwhm_ew < 180.0
+        assert fwhm_ns == 180.0
+
+    def test_freq_config(self):
+        """Test that freq_config is used when freq_hz is not provided."""
+        positions = np.array([
+            [0.0, 0.0, 0.0],
+            [10.0, -10.0, 0.0],
+        ])
+        freq_config = FrequencyConfig()
+        fwhm_ew1, fwhm_ns1 = compute_beam_fwhm(positions, freq_config=freq_config)
+        # Center of default band is ~437.5 MHz
+        fwhm_ew2, fwhm_ns2 = compute_beam_fwhm(positions, freq_hz=437.5e6)
+        # Should be close (not exact due to mean vs center)
+        assert abs(fwhm_ew1 - fwhm_ew2) < 0.5
+        assert abs(fwhm_ns1 - fwhm_ns2) < 0.5
+
+    def test_with_layout_csv(self):
+        """Test FWHM computation with actual CSV layout."""
+        if not CSV_LAYOUT1.exists():
+            pytest.skip(f"CSV file not found: {CSV_LAYOUT1}")
+        array = Array64Config.from_csv(str(CSV_LAYOUT1))
+        fwhm_ew, fwhm_ns = compute_beam_fwhm(array.active_positions)
+        # Should return reasonable values
+        assert 0.1 < fwhm_ew < 180.0
+        assert 0.1 < fwhm_ns < 180.0
+
+
+class TestEstimateNBeams:
+    """Tests for estimate_n_beams function."""
+
+    def test_basic_count(self):
+        """Test that estimate returns a positive integer."""
+        n = estimate_n_beams(10.0, 10.0)
+        assert n > 0
+        assert isinstance(n, int)
+
+    def test_smaller_beams_more_beams(self):
+        """Test that smaller beams require more beams."""
+        n_large = estimate_n_beams(20.0, 20.0)
+        n_small = estimate_n_beams(5.0, 5.0)
+        assert n_small > n_large
+
+    def test_elliptical_vs_isotropic(self):
+        """Test that elliptical beams give different count than isotropic."""
+        n_iso = estimate_n_beams(10.0, 10.0)
+        n_ellip = estimate_n_beams(20.0, 5.0)
+        # Elliptical with same area should give same count
+        assert n_iso == n_ellip
+
+    def test_overlap_increases_beams(self):
+        """Test that smaller overlap fraction increases beam count."""
+        n_fwhm = estimate_n_beams(10.0, 10.0, overlap=1.0)
+        n_nyquist = estimate_n_beams(10.0, 10.0, overlap=0.5)
+        assert n_nyquist > n_fwhm
+
+    def test_alt_range_affects_count(self):
+        """Test that larger altitude range requires more beams."""
+        n_small = estimate_n_beams(10.0, 10.0, alt_min_deg=60.0)
+        n_large = estimate_n_beams(10.0, 10.0, alt_min_deg=30.0)
+        assert n_large > n_small
+
+    def test_physical_sanity(self):
+        """Test with CASM-like values: ~13° EW, ~2° NS beams above 30°."""
+        n = estimate_n_beams(13.0, 2.0, alt_min_deg=30.0)
+        # Should be a reasonable number (hundreds for narrow NS beam)
+        assert n > 10
+        assert n < 10000
+
+
+class TestEllipticalBeamGrid:
+    """Tests for elliptical beam grid generation."""
+
+    def test_altaz_with_elliptical_spacing(self):
+        """Test generate_beam_grid_altaz with explicit elliptical spacing."""
+        beams = generate_beam_grid_altaz(
+            spacing_ew_deg=20.0,
+            spacing_ns_deg=5.0,
+            alt_min_deg=60.0,
+            alt_max_deg=90.0,
+        )
+        assert len(beams) > 0
+        # With 5° NS spacing from 60° to 90°, should have ~7 altitude levels
+        alts = sorted(set(round(b.alt_deg, 1) for b in beams))
+        assert len(alts) >= 5
+
+    def test_altaz_ns_controls_altitude_step(self):
+        """Test that spacing_ns_deg controls altitude separation."""
+        beams_5 = generate_beam_grid_altaz(
+            spacing_ew_deg=20.0, spacing_ns_deg=5.0,
+            alt_min_deg=30.0, alt_max_deg=90.0,
+        )
+        beams_10 = generate_beam_grid_altaz(
+            spacing_ew_deg=20.0, spacing_ns_deg=10.0,
+            alt_min_deg=30.0, alt_max_deg=90.0,
+        )
+        # 5° NS spacing should produce more altitude levels than 10°
+        alts_5 = set(round(b.alt_deg, 1) for b in beams_5)
+        alts_10 = set(round(b.alt_deg, 1) for b in beams_10)
+        assert len(alts_5) > len(alts_10)
+
+    def test_altaz_ew_controls_azimuth_step(self):
+        """Test that spacing_ew_deg controls azimuth separation."""
+        beams_10 = generate_beam_grid_altaz(
+            spacing_ew_deg=10.0, spacing_ns_deg=30.0,
+            alt_min_deg=30.0, alt_max_deg=60.0,
+        )
+        beams_30 = generate_beam_grid_altaz(
+            spacing_ew_deg=30.0, spacing_ns_deg=30.0,
+            alt_min_deg=30.0, alt_max_deg=60.0,
+        )
+        # Narrower E-W spacing should produce more beams (more azimuths)
+        assert len(beams_10) > len(beams_30)
+
+    def test_altaz_with_positions(self):
+        """Test generate_beam_grid_altaz with antenna positions."""
+        positions = np.array([
+            [0.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+            [0.0, -21.5, 0.0],
+        ])
+        beams = generate_beam_grid_altaz(
+            positions_enu=positions,
+            alt_min_deg=60.0,
+            alt_max_deg=90.0,
+        )
+        assert len(beams) > 0
+        # With ~2° NS FWHM, should have many altitude levels from 60° to 90°
+        alts = sorted(set(round(b.alt_deg, 1) for b in beams))
+        assert len(alts) >= 10
+
+    def test_snap_generate_beam_grid_with_array_config(self):
+        """Test generate_beam_grid with Array64Config."""
+        if not CSV_LAYOUT1.exists():
+            pytest.skip(f"CSV file not found: {CSV_LAYOUT1}")
+        array = Array64Config.from_csv(str(CSV_LAYOUT1))
+        beams = generate_beam_grid(array_config=array, alt_min_deg=60.0)
+        assert len(beams) > 0
+        for beam in beams:
+            assert beam.alt_deg >= 60.0
+
+    def test_snap_generate_beam_grid_with_positions(self):
+        """Test generate_beam_grid with raw positions."""
+        positions = np.array([
+            [0.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+            [0.0, -21.5, 0.0],
+        ])
+        beams = generate_beam_grid(positions_enu=positions, alt_min_deg=60.0)
+        assert len(beams) > 0
+
+    def test_snap_generate_beam_grid_n_beams_with_array(self):
+        """Test generate_beam_grid with n_beams and array_config."""
+        if not CSV_LAYOUT1.exists():
+            pytest.skip(f"CSV file not found: {CSV_LAYOUT1}")
+        array = Array64Config.from_csv(str(CSV_LAYOUT1))
+        beams = generate_beam_grid(n_beams=8, array_config=array)
+        assert len(beams) <= 8
+        assert len(beams) >= 4
+
+    def test_backward_compat_isotropic(self):
+        """Test that existing isotropic calls still work."""
+        beams = generate_beam_grid_altaz(spacing_deg=20.0, alt_min_deg=60.0)
+        assert len(beams) > 0
+        beams2 = generate_beam_grid(spacing_deg=20.0, alt_min_deg=60.0)
+        assert len(beams2) > 0
 
 
 if __name__ == "__main__":

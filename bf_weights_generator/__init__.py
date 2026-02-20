@@ -92,6 +92,8 @@ from .config import (
     DEFAULT_ANTENNA_POSITIONS,
     DEFAULT_N_ANTENNAS,
     SPEED_OF_LIGHT_M_S,
+    compute_beam_fwhm,
+    estimate_n_beams,
 )
 
 # Coordinate utilities
@@ -148,6 +150,8 @@ __all__ = [
     "DEFAULT_ANTENNA_POSITIONS",
     "DEFAULT_N_ANTENNAS",
     "SPEED_OF_LIGHT_M_S",
+    "compute_beam_fwhm",
+    "estimate_n_beams",
     # Coordinate utilities
     "compute_lst_rad",
     "radec_to_hadec",

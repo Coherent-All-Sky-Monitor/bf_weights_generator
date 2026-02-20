@@ -33,6 +33,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 try:
+    import matplotlib
+    matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     from matplotlib.patches import Circle
     MATPLOTLIB_AVAILABLE = True
@@ -285,7 +287,8 @@ def main():
     parser.add_argument(
         "--no-show",
         action="store_true",
-        help="Don't display plot (useful for saving only)",
+        default=True,
+        help="Don't display plot interactively (default: True, savefig only)",
     )
 
     args = parser.parse_args()

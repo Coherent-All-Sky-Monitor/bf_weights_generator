@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 import warnings
 
-from .config import ArrayConfig, FrequencyConfig, SPEED_OF_LIGHT_M_S
+from .config import ArrayConfig, FrequencyConfig, SPEED_OF_LIGHT_M_S, compute_beam_fwhm
 from .coordinates import (
     radec_to_direction_cosines,
     radec_to_direction_cosines_astropy,
@@ -192,10 +192,18 @@ def generate_beam_grid_altaz(
     az_min_deg: float = 0.0,
     az_max_deg: float = 360.0,
     spacing_deg: float = 4.0,
+    spacing_ew_deg: Optional[float] = None,
+    spacing_ns_deg: Optional[float] = None,
+    positions_enu: Optional[np.ndarray] = None,
+    freq_hz: Optional[float] = None,
     exclude_horizon: bool = True
 ) -> List[StationaryPointing]:
     """
     Generate a grid of stationary beam pointings in Alt/Az coordinates.
+
+    Supports both isotropic and elliptical beam spacing. Elliptical spacing
+    can be specified directly via ``spacing_ew_deg``/``spacing_ns_deg``, or
+    auto-computed from antenna positions via ``positions_enu``.
 
     Parameters
     ----------
@@ -208,9 +216,21 @@ def generate_beam_grid_altaz(
     az_max_deg : float
         Maximum azimuth in degrees (default: 360°).
     spacing_deg : float
-        Approximate beam spacing in degrees (default: 4°).
-        At higher altitudes, fewer azimuth beams are placed to maintain
-        roughly uniform sky coverage.
+        Isotropic beam spacing in degrees (default: 4°). Used when neither
+        elliptical spacing nor positions_enu are provided.
+    spacing_ew_deg : float, optional
+        E-W beam spacing in degrees. If provided with ``spacing_ns_deg``,
+        uses elliptical spacing (overrides ``spacing_deg``).
+    spacing_ns_deg : float, optional
+        N-S beam spacing in degrees. If provided with ``spacing_ew_deg``,
+        uses elliptical spacing (overrides ``spacing_deg``).
+    positions_enu : np.ndarray, optional
+        Antenna positions in ENU coordinates, shape (n_ant, 3). If provided,
+        auto-computes elliptical spacing from beam FWHM (lambda/D per axis).
+        Overrides ``spacing_deg``, ``spacing_ew_deg``, and ``spacing_ns_deg``.
+    freq_hz : float, optional
+        Reference frequency in Hz for FWHM computation (default: 437.5 MHz).
+        Only used when ``positions_enu`` is provided.
     exclude_horizon : bool
         If True, exclude beams below alt_min_deg (default: True).
 
@@ -224,12 +244,29 @@ def generate_beam_grid_altaz(
     The default spacing of 4° is based on CASM's current configuration
     (~13 antennas, ~10m baseline). Adjust based on your array's beam size:
         beam_FWHM ≈ λ/D ≈ 0.75m / 10m ≈ 4° at 400 MHz
+
+    When using elliptical spacing:
+    - Altitude step = ``spacing_ns_deg`` (N-S beam width)
+    - Azimuth step at each altitude = ``spacing_ew_deg / cos(alt)``
+      (E-W beam width with geometric correction for convergence)
     """
+    # Determine per-axis spacing
+    if positions_enu is not None:
+        fwhm_ew, fwhm_ns = compute_beam_fwhm(positions_enu, freq_hz=freq_hz)
+        spacing_ew = fwhm_ew
+        spacing_ns = fwhm_ns
+    elif spacing_ew_deg is not None and spacing_ns_deg is not None:
+        spacing_ew = spacing_ew_deg
+        spacing_ns = spacing_ns_deg
+    else:
+        spacing_ew = spacing_deg
+        spacing_ns = spacing_deg
+
     pointings = []
     beam_idx = 0
 
-    # Generate altitude levels
-    alt_values = np.arange(alt_min_deg, alt_max_deg + spacing_deg/2, spacing_deg)
+    # Generate altitude levels (N-S beam width controls altitude separation)
+    alt_values = np.arange(alt_min_deg, alt_max_deg + spacing_ns/2, spacing_ns)
 
     for alt in alt_values:
         if alt > 90.0:
@@ -244,7 +281,7 @@ def generate_beam_grid_altaz(
             # Circumference at this altitude: 2π * cos(alt)
             # Number of beams: circumference / spacing
             cos_alt = np.cos(np.deg2rad(alt))
-            az_spacing = spacing_deg / cos_alt if cos_alt > 0.1 else 360.0
+            az_spacing = spacing_ew / cos_alt if cos_alt > 0.1 else 360.0
 
             # Handle partial azimuth range
             az_range = az_max_deg - az_min_deg
