@@ -1016,10 +1016,19 @@ class TestGenerateCombinedWeights:
                 loaded.output_array_config.snap_to_ant64,
                 result.output_array_config.snap_to_ant64,
             )
-            # Check cal metadata round-tripped
+            # Check cal weights fully round-tripped
             assert loaded.cal_weights is not None
             assert loaded.cal_weights.source == result.cal_weights.source
             assert loaded.cal_weights.ref_ant_id == result.cal_weights.ref_ant_id
+            np.testing.assert_array_equal(
+                loaded.cal_weights.weights, result.cal_weights.weights,
+            )
+            np.testing.assert_array_equal(
+                loaded.cal_weights.ant_ids, result.cal_weights.ant_ids,
+            )
+            np.testing.assert_array_equal(
+                loaded.cal_weights.flags, result.cal_weights.flags,
+            )
 
     def test_flagged_channels_zero(self, pre_feb16, cal):
         """Flagged channels should have zero weights."""

@@ -768,6 +768,10 @@ def save_combined_weights_hdf5(
             cal_grp.create_dataset('ant_ids', data=cal.ant_ids)
             cal_grp.create_dataset('flags', data=cal.flags)
             cal_grp.create_dataset('frequencies_hz', data=cal.frequencies_hz)
+            cal_grp.create_dataset(
+                'weights', data=cal.weights,
+                compression=compression, compression_opts=compression_opts,
+            )
         else:
             f.attrs['calibration'] = 'none (geometric only)'
 
@@ -827,7 +831,7 @@ def load_combined_weights_hdf5(filepath: Union[str, Path]):
         if 'calibration' in f:
             cal_grp = f['calibration']
             cal_weights = CalibrationWeights(
-                weights=np.zeros((0, 0), dtype=complex),  # not stored in file
+                weights=cal_grp['weights'][:],
                 flags=cal_grp['flags'][:],
                 frequencies_hz=cal_grp['frequencies_hz'][:],
                 ant_ids=cal_grp['ant_ids'][:],

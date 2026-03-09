@@ -419,6 +419,7 @@ class SnapWeightsGenerator:
         self,
         geo_weights: np.ndarray,
         cal_weights: 'CalibrationWeights',
+        geo_fallback: bool = False,
     ) -> np.ndarray:
         """
         Combine geometric weights with calibration weights.
@@ -436,12 +437,15 @@ class SnapWeightsGenerator:
         cal_weights : CalibrationWeights
             Calibration weights. Frequency axis is auto-flipped to match
             geometric order if ascending.
+        geo_fallback : bool
+            If True, use geometric-only weights on flagged channels instead
+            of zeroing them. Default is False (zero flagged channels).
 
         Returns
         -------
         np.ndarray
             Combined weights, same shape as geo_weights. Flagged channels
-            are zeroed out.
+            are zeroed out unless geo_fallback is True.
 
         Raises
         ------
@@ -492,13 +496,18 @@ class SnapWeightsGenerator:
             if ci >= 0:
                 cal_aligned[i, :] = cal_w[ci, :]
 
-        # Zero flagged channels in cal
-        cal_aligned[:, ~cal_flags] = 0.0
-
         # Multiply: broadcast over beams
         combined = geo_weights.copy()
-        # Where cal is zero (flagged), result is zero. Where non-zero, multiply.
-        combined *= cal_aligned[np.newaxis, :, :]
+
+        if geo_fallback:
+            # On good channels: use cal * geo. On flagged channels: keep geo only.
+            good_mask = cal_flags  # (n_chan,) True = good
+            combined[:, :, good_mask] *= cal_aligned[np.newaxis, :, good_mask]
+            # Flagged channels remain as geo-only (untouched)
+        else:
+            # Zero flagged channels in cal, then multiply everything
+            cal_aligned[:, ~cal_flags] = 0.0
+            combined *= cal_aligned[np.newaxis, :, :]
 
         return combined
 
@@ -507,6 +516,7 @@ class SnapWeightsGenerator:
         pointings: Optional[List[StationaryPointing]] = None,
         scale_factor: float = 127.0,
         cal_weights: Optional['CalibrationWeights'] = None,
+        geo_fallback: bool = False,
     ) -> Int8StationaryWeights:
         """
         Compute int8-quantized stationary beamformer weights.
@@ -528,7 +538,11 @@ class SnapWeightsGenerator:
             Scale factor for quantization. Default is 127.0.
         cal_weights : CalibrationWeights, optional
             Delay calibration weights. If provided, combined with geometric
-            weights before quantization. Flagged channels are zeroed out.
+            weights before quantization. Flagged channels are zeroed out
+            unless geo_fallback is True.
+        geo_fallback : bool
+            If True, use geometric-only weights on channels where calibration
+            is flagged, instead of zeroing them. Default is False.
 
         Returns
         -------
@@ -549,7 +563,7 @@ class SnapWeightsGenerator:
         # Step 1.5: Combine with calibration weights if provided
         if cal_weights is not None:
             active_weights = self._apply_calibration_weights(
-                active_weights, cal_weights
+                active_weights, cal_weights, geo_fallback=geo_fallback,
             )
 
         n_beams = len(pointings)

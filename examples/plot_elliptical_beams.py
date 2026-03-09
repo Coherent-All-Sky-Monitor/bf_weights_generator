@@ -107,17 +107,23 @@ def plot_elliptical_beams(
         x = za * np.sin(az_rad)
         y = za * np.cos(az_rad)
 
-        # Ellipse dimensions
-        # N-S FWHM maps to altitude direction (radial in this projection)
-        # E-W FWHM maps to azimuth direction, but scales with 1/cos(alt) on sky
-        # In the flat zenith-angle projection, the radial extent = fwhm_ns
-        # and the tangential extent = fwhm_ew (already in degrees on sky)
-        height = fwhm_ns_deg  # radial (altitude) direction
-        width = fwhm_ew_deg   # tangential (azimuth) direction
-
-        # Ellipse orientation: the radial direction points from center to beam
-        # angle = azimuth measured from +y axis (North), so rotation is -az
-        angle = -p.az_deg
+        # Ellipse dimensions in the zenithal projection:
+        # Near zenith (za < fwhm_ns), the beam is essentially a circle
+        # because azimuth direction is undefined. Use max(fwhm_ew, fwhm_ns)
+        # as diameter and draw as a circle centered on zenith.
+        if za < fwhm_ns_deg:
+            # Near-zenith: draw as circle with average FWHM
+            diameter = max(fwhm_ew_deg, fwhm_ns_deg)
+            width = diameter
+            height = diameter
+            angle = 0
+        else:
+            # N-S FWHM maps to radial (altitude) direction
+            # E-W FWHM maps to tangential (azimuth) direction
+            height = fwhm_ns_deg
+            width = fwhm_ew_deg
+            # Ellipse orientation: radial direction points from center to beam
+            angle = -p.az_deg
 
         color = cmap(norm(p.alt_deg))
         ellipse = Ellipse(
@@ -204,12 +210,13 @@ def plot_elliptical_beams_rectangular(
 
         # E-W FWHM is the azimuth extent on sky; correct for cos(alt)
         # convergence so the ellipse width in azimuth degrees is larger
-        # at higher altitudes
+        # at higher altitudes. Cap at 120° to keep near-zenith beams visible
+        # (above ~85° alt, the beam wraps around in azimuth anyway).
         cos_alt = np.cos(np.deg2rad(alt))
         if cos_alt > 0.01:
-            width_az = fwhm_ew_deg / cos_alt
+            width_az = min(fwhm_ew_deg / cos_alt, 120.0)
         else:
-            width_az = 360.0
+            width_az = 120.0
         height_alt = fwhm_ns_deg
 
         color = cmap(norm(alt))
