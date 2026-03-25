@@ -92,6 +92,8 @@ from .config import (
     DEFAULT_ANTENNA_POSITIONS,
     DEFAULT_N_ANTENNAS,
     SPEED_OF_LIGHT_M_S,
+    compute_beam_fwhm,
+    estimate_n_beams,
 )
 
 # Coordinate utilities
@@ -113,6 +115,8 @@ from .io import (
     save_int8_weights_hdf5,
     load_int8_weights_hdf5,
     inspect_int8_weights_file,
+    save_combined_weights_hdf5,
+    load_combined_weights_hdf5,
 )
 
 # SNAP 64-antenna weights
@@ -120,6 +124,10 @@ from .snap_weights import (
     Array64Config,
     SnapWeightsGenerator,
     Int8StationaryWeights,
+    CombinedWeights,
+    CalibrationWeights,
+    load_calibration_weights,
+    generate_combined_weights,
     TRANSIT_SURVEY_BEAMS,
     parse_beams_arg,
     generate_beam_grid,
@@ -148,6 +156,8 @@ __all__ = [
     "DEFAULT_ANTENNA_POSITIONS",
     "DEFAULT_N_ANTENNAS",
     "SPEED_OF_LIGHT_M_S",
+    "compute_beam_fwhm",
+    "estimate_n_beams",
     # Coordinate utilities
     "compute_lst_rad",
     "radec_to_hadec",
@@ -163,10 +173,16 @@ __all__ = [
     "save_int8_weights_hdf5",
     "load_int8_weights_hdf5",
     "inspect_int8_weights_file",
+    "save_combined_weights_hdf5",
+    "load_combined_weights_hdf5",
     # SNAP 64-antenna weights
     "Array64Config",
     "SnapWeightsGenerator",
     "Int8StationaryWeights",
+    "CombinedWeights",
+    "CalibrationWeights",
+    "load_calibration_weights",
+    "generate_combined_weights",
     "TRANSIT_SURVEY_BEAMS",
     "parse_beams_arg",
     "generate_beam_grid",

@@ -27,11 +27,19 @@ from .weights import (
 )
 from .config import ArrayConfig, FrequencyConfig
 
-# Import Int8StationaryWeights and Array64Config lazily to avoid circular imports
+# Import snap_weights classes lazily to avoid circular imports
 def _get_snap_weights_classes():
     """Lazy import of snap_weights module classes."""
     from .snap_weights import Int8StationaryWeights, Array64Config
     return Int8StationaryWeights, Array64Config
+
+
+def _get_combined_weights_classes():
+    """Lazy import of CombinedWeights and related classes."""
+    from .snap_weights import (
+        CombinedWeights, Array64Config, CalibrationWeights,
+    )
+    return CombinedWeights, Array64Config, CalibrationWeights
 
 
 def _check_h5py():
@@ -640,3 +648,205 @@ def inspect_int8_weights_file(filepath: Union[str, Path]) -> dict:
         info['beam_names'] = names
 
     return info
+
+
+# =============================================================================
+# Combined Weights I/O (complex64 geo+cal)
+# =============================================================================
+
+def _save_array64_config_group(grp, config):
+    """Save Array64Config into an HDF5 group."""
+    grp.create_dataset('positions_enu', data=config.positions_enu)
+    grp.create_dataset('active_mask', data=config.active_mask)
+    grp.create_dataset('snap_to_ant64', data=config.snap_to_ant64)
+    grp.create_dataset('ant64_to_snap', data=config.ant64_to_snap)
+    grp.attrs['csv_path'] = config.csv_path
+    grp.attrs['pos_ids'] = json.dumps(config.pos_ids)
+    grp.attrs['n_active'] = config.n_active
+
+
+def _load_array64_config_group(grp):
+    """Load Array64Config from an HDF5 group."""
+    _, Array64Config, _ = _get_combined_weights_classes()
+    return Array64Config(
+        positions_enu=grp['positions_enu'][:],
+        active_mask=grp['active_mask'][:],
+        snap_to_ant64=grp['snap_to_ant64'][:],
+        ant64_to_snap=grp['ant64_to_snap'][:],
+        pos_ids=json.loads(grp.attrs['pos_ids']),
+        csv_path=grp.attrs.get('csv_path', ''),
+    )
+
+
+def save_combined_weights_hdf5(
+    weights,  # CombinedWeights - type hint omitted to avoid circular import
+    filepath: Union[str, Path],
+    compression: str = "gzip",
+    compression_opts: int = 4,
+    overwrite: bool = False,
+) -> None:
+    """
+    Save combined geo+cal beamformer weights to HDF5.
+
+    Parameters
+    ----------
+    weights : CombinedWeights
+        Combined weights object to save.
+    filepath : str or Path
+        Output file path.
+    compression : str, optional
+        Compression algorithm. Default is "gzip".
+    compression_opts : int, optional
+        Compression level (1-9). Default is 4.
+    overwrite : bool, optional
+        Whether to overwrite existing file. Default is False.
+    """
+    _check_h5py()
+
+    filepath = Path(filepath)
+    if filepath.exists() and not overwrite:
+        raise FileExistsError(f"File exists: {filepath}. Use overwrite=True to replace.")
+
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+
+    with h5py.File(filepath, 'w') as f:
+        # Main data
+        f.create_dataset(
+            'weights', data=weights.weights,
+            compression=compression, compression_opts=compression_opts,
+        )
+        f.create_dataset('frequencies_hz', data=weights.frequencies_hz)
+        f.create_dataset('channel_flags', data=weights.flags)
+
+        # Root attributes
+        f.attrs['format_type'] = 'combined_complex64_snap_weights'
+        f.attrs['version'] = '1.0'
+        f.attrs['created_utc'] = datetime.now(timezone.utc).isoformat()
+        f.attrs['n_beams'] = weights.n_beams
+        f.attrs['n_antennas'] = 64
+        f.attrs['n_channels'] = weights.n_channels
+        f.attrs['n_good_channels'] = weights.n_good_channels
+        f.attrs['weights_dtype'] = str(weights.weights.dtype)
+        f.attrs['freq_order'] = weights.freq_order
+        f.attrs['antenna_order'] = 'snap_input'
+
+        # Pointings
+        pt_grp = f.create_group('pointings')
+        pt_grp.create_dataset('alt_deg', data=[p.alt_deg for p in weights.pointings])
+        pt_grp.create_dataset('az_deg', data=[p.az_deg for p in weights.pointings])
+        pt_grp.create_dataset('l', data=[p.l for p in weights.pointings])
+        pt_grp.create_dataset('m', data=[p.m for p in weights.pointings])
+        pt_grp.create_dataset('n', data=[p.n for p in weights.pointings])
+        pt_grp.attrs['names'] = json.dumps([p.name for p in weights.pointings])
+
+        # Compute array config
+        _save_array64_config_group(
+            f.create_group('compute_array_config'), weights.array_config
+        )
+
+        # Output array config
+        _save_array64_config_group(
+            f.create_group('output_array_config'), weights.output_array_config
+        )
+
+        # Frequency config
+        freq_grp = f.create_group('freq_config')
+        freq_grp.attrs['n_chan'] = weights.freq_config.n_chan
+        freq_grp.attrs['total_bw_mhz'] = weights.freq_config.total_bw_mhz
+        freq_grp.attrs['total_n_chan'] = weights.freq_config.total_n_chan
+        freq_grp.attrs['freq_end_voltage_mhz'] = weights.freq_config.freq_end_voltage_mhz
+
+        # Calibration metadata
+        if weights.cal_weights is not None:
+            cal = weights.cal_weights
+            cal_grp = f.create_group('calibration')
+            cal_grp.attrs['source'] = cal.source
+            cal_grp.attrs['ref_ant_id'] = cal.ref_ant_id
+            cal_grp.attrs['n_cal_antennas'] = len(cal.ant_ids)
+            cal_grp.attrs['n_good_channels'] = int(np.sum(cal.flags))
+            cal_grp.attrs['n_total_channels'] = len(cal.flags)
+            cal_grp.create_dataset('ant_ids', data=cal.ant_ids)
+            cal_grp.create_dataset('flags', data=cal.flags)
+            cal_grp.create_dataset('frequencies_hz', data=cal.frequencies_hz)
+            cal_grp.create_dataset(
+                'weights', data=cal.weights,
+                compression=compression, compression_opts=compression_opts,
+            )
+        else:
+            f.attrs['calibration'] = 'none (geometric only)'
+
+
+def load_combined_weights_hdf5(filepath: Union[str, Path]):
+    """
+    Load combined geo+cal beamformer weights from HDF5.
+
+    Parameters
+    ----------
+    filepath : str or Path
+        Input file path.
+
+    Returns
+    -------
+    CombinedWeights
+        Loaded combined weights object.
+    """
+    _check_h5py()
+    CombinedWeights, Array64Config, CalibrationWeights = _get_combined_weights_classes()
+
+    filepath = Path(filepath)
+    if not filepath.exists():
+        raise FileNotFoundError(f"File not found: {filepath}")
+
+    with h5py.File(filepath, 'r') as f:
+        weights_data = f['weights'][:]
+        frequencies_hz = f['frequencies_hz'][:]
+        flags = f['channel_flags'][:]
+        freq_order = f.attrs.get('freq_order', 'descending')
+
+        # Pointings
+        pt_grp = f['pointings']
+        alt_deg = pt_grp['alt_deg'][:]
+        az_deg = pt_grp['az_deg'][:]
+        names = json.loads(pt_grp.attrs['names'])
+        pointings = [
+            StationaryPointing(alt_deg=alt, az_deg=az, name=name)
+            for alt, az, name in zip(alt_deg, az_deg, names)
+        ]
+
+        # Array configs
+        array_config = _load_array64_config_group(f['compute_array_config'])
+        output_array_config = _load_array64_config_group(f['output_array_config'])
+
+        # Frequency config
+        freq_grp = f['freq_config']
+        freq_config = FrequencyConfig(
+            n_chan=int(freq_grp.attrs['n_chan']),
+            total_bw_mhz=float(freq_grp.attrs['total_bw_mhz']),
+            total_n_chan=int(freq_grp.attrs['total_n_chan']),
+            freq_end_voltage_mhz=float(freq_grp.attrs['freq_end_voltage_mhz']),
+        )
+
+        # Calibration metadata (optional)
+        cal_weights = None
+        if 'calibration' in f:
+            cal_grp = f['calibration']
+            cal_weights = CalibrationWeights(
+                weights=cal_grp['weights'][:],
+                flags=cal_grp['flags'][:],
+                frequencies_hz=cal_grp['frequencies_hz'][:],
+                ant_ids=cal_grp['ant_ids'][:],
+                ref_ant_id=int(cal_grp.attrs['ref_ant_id']),
+                source=str(cal_grp.attrs['source']),
+            )
+
+        return CombinedWeights(
+            weights=weights_data,
+            frequencies_hz=frequencies_hz,
+            flags=flags,
+            pointings=pointings,
+            array_config=array_config,
+            output_array_config=output_array_config,
+            freq_config=freq_config,
+            cal_weights=cal_weights,
+            freq_order=freq_order,
+        )

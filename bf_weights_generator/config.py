@@ -4,7 +4,7 @@ Configuration constants and array parameters for CASM beamformer.
 
 import numpy as np
 from dataclasses import dataclass, field
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 # =============================================================================
 # OVRO Observatory Location
@@ -200,3 +200,114 @@ class ArrayConfig:
         return (f"ArrayConfig(n_antennas={self.n_antennas}, "
                 f"n_active={self.n_active_antennas}, "
                 f"location=({self.lat_deg:.4f}°N, {abs(self.lon_deg):.4f}°W))")
+
+
+# =============================================================================
+# Beam FWHM and beam count utilities
+# =============================================================================
+
+def compute_beam_fwhm(
+    positions_enu: np.ndarray,
+    freq_hz: Optional[float] = None,
+    freq_config: Optional[FrequencyConfig] = None,
+) -> Tuple[float, float]:
+    """
+    Compute beam FWHM in E-W and N-S from antenna positions.
+
+    The beam FWHM is approximately lambda/D where D is the maximum baseline
+    in each direction. For arrays with asymmetric baselines (e.g., CASM with
+    ~3m E-W and ~21.5m N-S), the beam is elliptical.
+
+    Parameters
+    ----------
+    positions_enu : np.ndarray
+        Antenna positions in ENU coordinates, shape (n_ant, 3).
+        Only active/valid positions should be passed.
+    freq_hz : float, optional
+        Reference frequency in Hz. If None, uses center of band from
+        freq_config, or 437.5 MHz as default.
+    freq_config : FrequencyConfig, optional
+        Frequency configuration to derive center frequency from.
+
+    Returns
+    -------
+    fwhm_ew_deg : float
+        Beam FWHM in the E-W direction (degrees).
+    fwhm_ns_deg : float
+        Beam FWHM in the N-S direction (degrees).
+    """
+    positions_enu = np.asarray(positions_enu, dtype=np.float64)
+
+    if freq_hz is None:
+        if freq_config is not None:
+            freqs = freq_config.get_frequencies_hz()
+            freq_hz = float(np.mean(freqs))
+        else:
+            freq_hz = 437.5e6  # Default center of CASM band
+
+    wavelength = SPEED_OF_LIGHT_M_S / freq_hz
+
+    # Max baselines in E-W and N-S
+    d_ew = positions_enu[:, 0].max() - positions_enu[:, 0].min()
+    d_ns = positions_enu[:, 1].max() - positions_enu[:, 1].min()
+
+    # lambda / D in radians -> degrees
+    # If baseline is 0 (single antenna in that axis), return 180° (hemisphere)
+    if d_ew > 0:
+        fwhm_ew_deg = np.rad2deg(wavelength / d_ew)
+    else:
+        fwhm_ew_deg = 180.0
+
+    if d_ns > 0:
+        fwhm_ns_deg = np.rad2deg(wavelength / d_ns)
+    else:
+        fwhm_ns_deg = 180.0
+
+    return fwhm_ew_deg, fwhm_ns_deg
+
+
+def estimate_n_beams(
+    fwhm_ew_deg: float,
+    fwhm_ns_deg: float,
+    alt_min_deg: float = 30.0,
+    alt_max_deg: float = 90.0,
+    overlap: float = 1.0,
+) -> int:
+    """
+    Estimate number of beams to tile a field of view.
+
+    Parameters
+    ----------
+    fwhm_ew_deg : float
+        Beam FWHM in E-W direction (degrees).
+    fwhm_ns_deg : float
+        Beam FWHM in N-S direction (degrees).
+    alt_min_deg : float
+        Minimum altitude in degrees (default: 30.0).
+    alt_max_deg : float
+        Maximum altitude in degrees (default: 90.0).
+    overlap : float
+        Fraction of FWHM for beam spacing (default: 1.0 = FWHM spacing,
+        0.5 = Nyquist/half-power overlap).
+
+    Returns
+    -------
+    int
+        Estimated number of beams needed.
+    """
+    spacing_ew_rad = np.deg2rad(fwhm_ew_deg * overlap)
+    spacing_ns_rad = np.deg2rad(fwhm_ns_deg * overlap)
+
+    # Solid angle of spherical cap between alt_min and alt_max
+    # Omega = 2*pi * (sin(alt_max) - sin(alt_min))
+    solid_angle = 2 * np.pi * (
+        np.sin(np.deg2rad(alt_max_deg)) - np.sin(np.deg2rad(alt_min_deg))
+    )
+
+    # Each beam covers approximately spacing_ew * spacing_ns steradians
+    beam_area = spacing_ew_rad * spacing_ns_rad
+
+    if beam_area <= 0:
+        return 1
+
+    return max(1, int(np.ceil(solid_angle / beam_area)))

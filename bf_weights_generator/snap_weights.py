@@ -17,7 +17,7 @@ from typing import List, Optional, Tuple
 from pathlib import Path
 import csv
 
-from .config import ArrayConfig, FrequencyConfig
+from .config import ArrayConfig, FrequencyConfig, compute_beam_fwhm
 from .weights import (
     GeometricBeamformer,
     StationaryPointing,
@@ -196,7 +196,7 @@ class Int8StationaryWeights:
     The weights are stored in the format expected by SNAP hardware:
     - Shape: (2, n_chan, 2, n_beams, 64) = (real/imag, chan, pol, beam, ant)
     - Antenna dimension is in SNAP input order
-    - Channels are in reversed order (low-to-high frequency)
+    - Channels are in descending frequency order (high-to-low, native SNAP order)
 
     Attributes
     ----------
@@ -259,6 +259,112 @@ class Int8StationaryWeights:
                 f"n_beams={self.n_beams}, n_chan={self.n_channels})")
 
 
+@dataclass
+class CalibrationWeights:
+    """
+    Container for delay calibration weights loaded from SVD pipeline output.
+
+    These weights correct for instrumental phase offsets (cable delays,
+    electronics, etc.). They are derived by fringe-stopping visibilities
+    toward a bright source and extracting per-antenna complex gains via SVD.
+
+    The stored weights are conj(gain), ready for direct multiplication with
+    geometric weights: w_total = w_cal * w_geo.
+
+    Attributes
+    ----------
+    weights : np.ndarray
+        (n_ant, n_chan) complex array, frequency ascending.
+    flags : np.ndarray
+        (n_chan,) boolean array. True = good channel, False = flagged.
+    frequencies_hz : np.ndarray
+        (n_chan,) float64, ascending order.
+    ant_ids : np.ndarray
+        (n_ant,) int array, 1-indexed antenna IDs.
+    ref_ant_id : int
+        Reference antenna ID used in SVD calibration.
+    source : str
+        Calibrator source name (e.g. "SUN").
+    """
+    weights: np.ndarray
+    flags: np.ndarray
+    frequencies_hz: np.ndarray
+    ant_ids: np.ndarray
+    ref_ant_id: int
+    source: str = ""
+
+
+def load_calibration_weights(npz_path: str) -> CalibrationWeights:
+    """
+    Load SVD calibration weights from .npz file.
+
+    Parameters
+    ----------
+    npz_path : str
+        Path to the .npz file produced by the SVD calibration pipeline.
+
+    Returns
+    -------
+    CalibrationWeights
+        Loaded calibration weights with metadata.
+
+    Raises
+    ------
+    ValueError
+        If the file has inconsistent shapes or non-ascending frequencies.
+    FileNotFoundError
+        If the file does not exist.
+    """
+    data = np.load(npz_path, allow_pickle=True)
+
+    weights = data['weights']
+    flags = data['flags']
+    ant_ids = data['ant_ids']
+
+    # Get frequencies (prefer Hz, fall back to MHz)
+    if 'freqs_hz' in data:
+        frequencies_hz = data['freqs_hz'].astype(np.float64)
+    elif 'freqs_mhz' in data:
+        frequencies_hz = data['freqs_mhz'].astype(np.float64) * 1e6
+    else:
+        raise ValueError("Cal weights file must contain 'freqs_hz' or 'freqs_mhz'")
+
+    # Validate shapes
+    n_ant, n_chan = weights.shape
+    if len(flags) != n_chan:
+        raise ValueError(
+            f"Shape mismatch: weights has {n_chan} channels but flags has {len(flags)}"
+        )
+    if len(frequencies_hz) != n_chan:
+        raise ValueError(
+            f"Shape mismatch: weights has {n_chan} channels but frequencies has "
+            f"{len(frequencies_hz)}"
+        )
+    if len(ant_ids) != n_ant:
+        raise ValueError(
+            f"Shape mismatch: weights has {n_ant} antennas but ant_ids has "
+            f"{len(ant_ids)}"
+        )
+
+    # Ensure frequencies are in ascending order (flip if descending)
+    if n_chan > 1 and frequencies_hz[1] < frequencies_hz[0]:
+        frequencies_hz = frequencies_hz[::-1]
+        weights = weights[:, ::-1]
+        flags = flags[::-1]
+
+    ref_ant_id = int(data['ref_ant_id']) if 'ref_ant_id' in data else 0
+    source = str(data['source']) if 'source' in data else ""
+
+    return CalibrationWeights(
+        weights=weights,
+        flags=flags,
+        frequencies_hz=frequencies_hz,
+        ant_ids=ant_ids,
+        ref_ant_id=ref_ant_id,
+        source=source,
+    )
+
+
 class SnapWeightsGenerator:
     """
     Generate int8-quantized beamformer weights for SNAP hardware.
@@ -273,9 +379,15 @@ class SnapWeightsGenerator:
     Parameters
     ----------
     array_config : Array64Config
-        64-slot array configuration loaded from CSV.
+        64-slot array configuration loaded from CSV. Used for computing
+        geometric weights (antenna positions).
     freq_config : FrequencyConfig, optional
         Frequency configuration. Uses default CASM configuration if not specified.
+    output_array_config : Array64Config, optional
+        Array configuration for SNAP output ordering. If provided, the SNAP
+        reordering step uses this layout's snap_to_ant64 mapping instead of
+        array_config's. This is useful when the calibration data was taken with
+        a different SNAP board assignment than the current one.
 
     Examples
     --------
@@ -291,8 +403,10 @@ class SnapWeightsGenerator:
         self,
         array_config: Array64Config,
         freq_config: Optional[FrequencyConfig] = None,
+        output_array_config: Optional[Array64Config] = None,
     ):
         self.array_config = array_config
+        self.output_array_config = output_array_config or array_config
         self.freq_config = freq_config or FrequencyConfig()
 
         # Create beamformer with only active antennas
@@ -301,18 +415,117 @@ class SnapWeightsGenerator:
             freq_config=self.freq_config,
         )
 
+    def _apply_calibration_weights(
+        self,
+        geo_weights: np.ndarray,
+        cal_weights: 'CalibrationWeights',
+        geo_fallback: bool = False,
+    ) -> np.ndarray:
+        """
+        Combine geometric weights with calibration weights.
+
+        Performs element-wise multiplication: w_total = w_cal * w_geo.
+        Cal weights are auto-flipped to match the geometric frequency order
+        (descending) if they are in ascending order. Antenna mapping uses
+        ant_id → ant64 conversion.
+
+        Parameters
+        ----------
+        geo_weights : np.ndarray
+            Geometric weights, shape (n_beams, n_active, n_chan).
+            Frequencies in FrequencyConfig order (descending).
+        cal_weights : CalibrationWeights
+            Calibration weights. Frequency axis is auto-flipped to match
+            geometric order if ascending.
+        geo_fallback : bool
+            If True, use geometric-only weights on flagged channels instead
+            of zeroing them. Default is False (zero flagged channels).
+
+        Returns
+        -------
+        np.ndarray
+            Combined weights, same shape as geo_weights. Flagged channels
+            are zeroed out unless geo_fallback is True.
+
+        Raises
+        ------
+        ValueError
+            If channel counts differ or antenna mapping fails.
+        """
+        n_geo_chan = geo_weights.shape[2]
+        n_cal_chan = cal_weights.weights.shape[1]
+
+        if n_geo_chan != n_cal_chan:
+            raise ValueError(
+                f"Channel count mismatch: geo has {n_geo_chan}, "
+                f"cal has {n_cal_chan}"
+            )
+
+        # Get cal data — flip to descending if ascending
+        cal_freqs = cal_weights.frequencies_hz
+        is_ascending = len(cal_freqs) > 1 and cal_freqs[1] > cal_freqs[0]
+
+        if is_ascending:
+            cal_w = cal_weights.weights[:, ::-1]    # (n_ant, n_chan) descending
+            cal_flags = cal_weights.flags[::-1]      # (n_chan,) descending
+        else:
+            cal_w = cal_weights.weights
+            cal_flags = cal_weights.flags
+
+        # --- Antenna mapping: cal ant_ids (1-indexed) → ant64 (0-indexed) ---
+        active_indices = self.array_config.active_indices
+        n_active = len(active_indices)
+        cal_ant64 = cal_weights.ant_ids - 1
+
+        cal_ant_map = np.full(n_active, -1, dtype=np.int32)
+        for i, ant64_idx in enumerate(active_indices):
+            matches = np.where(cal_ant64 == ant64_idx)[0]
+            if len(matches) == 1:
+                cal_ant_map[i] = matches[0]
+            elif len(matches) == 0:
+                raise ValueError(
+                    f"Active antenna ant64={ant64_idx} not found in cal weights "
+                    f"ant_ids={cal_weights.ant_ids}"
+                )
+
+        # --- Combine: w_total = w_cal * w_geo ---
+        # Build cal array aligned to active antenna ordering: (n_active, n_chan)
+        cal_aligned = np.zeros((n_active, n_geo_chan), dtype=np.complex64)
+        for i in range(n_active):
+            ci = cal_ant_map[i]
+            if ci >= 0:
+                cal_aligned[i, :] = cal_w[ci, :]
+
+        # Multiply: broadcast over beams
+        combined = geo_weights.copy()
+
+        if geo_fallback:
+            # On good channels: use cal * geo. On flagged channels: keep geo only.
+            good_mask = cal_flags  # (n_chan,) True = good
+            combined[:, :, good_mask] *= cal_aligned[np.newaxis, :, good_mask]
+            # Flagged channels remain as geo-only (untouched)
+        else:
+            # Zero flagged channels in cal, then multiply everything
+            cal_aligned[:, ~cal_flags] = 0.0
+            combined *= cal_aligned[np.newaxis, :, :]
+
+        return combined
+
     def compute_int8_weights(
         self,
         pointings: Optional[List[StationaryPointing]] = None,
         scale_factor: float = 127.0,
+        cal_weights: Optional['CalibrationWeights'] = None,
+        geo_fallback: bool = False,
     ) -> Int8StationaryWeights:
         """
         Compute int8-quantized stationary beamformer weights.
 
         Processing steps:
-        1. Compute complex64 weights for active antennas
+        1. Compute complex64 geometric weights for active antennas
+        1.5. (Optional) Combine with calibration weights
         2. Expand to 64 slots (inactive = 0)
-        3. Reorder antennas to SNAP input order
+        3. Reorder antennas to SNAP input order (using output_array_config)
         4. Reverse channel order
         5. Quantize to int8
         6. Add polarization dimension (Pol A = Pol B)
@@ -323,6 +536,13 @@ class SnapWeightsGenerator:
             Beam pointing directions. If None, uses TRANSIT_SURVEY_BEAMS.
         scale_factor : float
             Scale factor for quantization. Default is 127.0.
+        cal_weights : CalibrationWeights, optional
+            Delay calibration weights. If provided, combined with geometric
+            weights before quantization. Flagged channels are zeroed out
+            unless geo_fallback is True.
+        geo_fallback : bool
+            If True, use geometric-only weights on channels where calibration
+            is flagged, instead of zeroing them. Default is False.
 
         Returns
         -------
@@ -340,6 +560,12 @@ class SnapWeightsGenerator:
         # Shape: (n_beams, n_active_ant, n_chan)
         active_weights = stationary.weights
 
+        # Step 1.5: Combine with calibration weights if provided
+        if cal_weights is not None:
+            active_weights = self._apply_calibration_weights(
+                active_weights, cal_weights, geo_fallback=geo_fallback,
+            )
+
         n_beams = len(pointings)
         n_chan = self.freq_config.n_chan
 
@@ -349,20 +575,18 @@ class SnapWeightsGenerator:
         for i, ant64_idx in enumerate(active_indices):
             weights_64[:, ant64_idx, :] = active_weights[:, i, :]
 
-        # Step 3: Reorder antennas to SNAP input order
+        # Step 3: Reorder antennas to SNAP input order (using output layout)
         weights_snap_order = np.zeros((n_beams, 64, n_chan), dtype=np.complex64)
+        snap_mapping = self.output_array_config.snap_to_ant64
         for snap_idx in range(64):
-            ant64_idx = self.array_config.snap_to_ant64[snap_idx]
+            ant64_idx = snap_mapping[snap_idx]
             if ant64_idx >= 0:
                 weights_snap_order[:, snap_idx, :] = weights_64[:, ant64_idx, :]
             # else: stays zero (inactive SNAP input)
 
-        # Step 4: Reverse channel order
-        weights_reversed = weights_snap_order[:, :, ::-1]
-
         # Step 5: Quantize to int8
-        real_scaled = np.round(weights_reversed.real * scale_factor)
-        imag_scaled = np.round(weights_reversed.imag * scale_factor)
+        real_scaled = np.round(weights_snap_order.real * scale_factor)
+        imag_scaled = np.round(weights_snap_order.imag * scale_factor)
         real_int8 = np.clip(real_scaled, -128, 127).astype(np.int8)
         imag_int8 = np.clip(imag_scaled, -128, 127).astype(np.int8)
 
@@ -381,8 +605,8 @@ class SnapWeightsGenerator:
         # Shape: (2, n_chan, 2, n_beams, 64)
         weights_int8 = np.stack([real_with_pol, imag_with_pol], axis=0)
 
-        # Compute reversed frequencies
-        frequencies_hz = self.freq_config.get_frequencies_hz()[::-1]
+        # Frequencies in native descending order (high-to-low, matching SNAP hardware)
+        frequencies_hz = self.freq_config.get_frequencies_hz()
 
         return Int8StationaryWeights(
             weights_int8=weights_int8,
@@ -394,8 +618,189 @@ class SnapWeightsGenerator:
         )
 
     def __repr__(self) -> str:
-        return (f"SnapWeightsGenerator(array={self.array_config}, "
-                f"freq={self.freq_config})")
+        parts = [f"array={self.array_config}", f"freq={self.freq_config}"]
+        if self.output_array_config is not self.array_config:
+            parts.append(f"output_array={self.output_array_config}")
+        return f"SnapWeightsGenerator({', '.join(parts)})"
+
+
+@dataclass
+class CombinedWeights:
+    """
+    Container for combined geometric + calibration beamformer weights.
+
+    Holds complex64 weights in SNAP input order, ready for beamforming.
+    Self-contained result with all metadata needed for file I/O and analysis.
+
+    Attributes
+    ----------
+    weights : np.ndarray
+        (n_beams, 64, n_chan) complex64 weights in SNAP input order.
+    frequencies_hz : np.ndarray
+        (n_chan,) float64 channel frequencies in Hz.
+    flags : np.ndarray
+        (n_chan,) bool, True = good channel.
+    pointings : List[StationaryPointing]
+        Beam pointing directions.
+    array_config : Array64Config
+        Layout used for geometric weight computation (antenna positions).
+    output_array_config : Array64Config
+        Layout used for SNAP input ordering.
+    freq_config : FrequencyConfig
+        Frequency configuration.
+    cal_weights : CalibrationWeights or None
+        Calibration weights used, or None if geometric only.
+    freq_order : str
+        "descending" or "ascending" — ordering of the frequency axis.
+    """
+    weights: np.ndarray
+    frequencies_hz: np.ndarray
+    flags: np.ndarray
+    pointings: List[StationaryPointing]
+    array_config: Array64Config
+    output_array_config: Array64Config
+    freq_config: FrequencyConfig
+    cal_weights: Optional[CalibrationWeights]
+    freq_order: str = "descending"
+
+    @property
+    def n_beams(self) -> int:
+        return len(self.pointings)
+
+    @property
+    def n_channels(self) -> int:
+        return len(self.frequencies_hz)
+
+    @property
+    def n_good_channels(self) -> int:
+        return int(np.sum(self.flags))
+
+    def __repr__(self) -> str:
+        cal_str = f"cal={self.cal_weights.source}" if self.cal_weights else "geo-only"
+        return (
+            f"CombinedWeights(n_beams={self.n_beams}, n_chan={self.n_channels}, "
+            f"good_chan={self.n_good_channels}, {cal_str}, "
+            f"freq_order={self.freq_order!r})"
+        )
+
+
+def generate_combined_weights(
+    pointing,
+    array_config: Array64Config,
+    cal_weights: Optional[CalibrationWeights] = None,
+    output_array_config: Optional[Array64Config] = None,
+    freq_config: Optional[FrequencyConfig] = None,
+    freq_order: str = "descending",
+) -> CombinedWeights:
+    """
+    Generate combined geometric + calibration beamformer weights.
+
+    Computes complex64 weights that combine geometric steering phases with
+    optional SVD-derived delay calibration corrections. Returns weights in
+    SNAP input order, ready for beamforming.
+
+    Parameters
+    ----------
+    pointing : StationaryPointing or List[StationaryPointing]
+        Beam pointing direction(s).
+    array_config : Array64Config
+        Antenna layout used for geometric weight computation (positions).
+    cal_weights : CalibrationWeights, optional
+        Delay calibration weights. If provided, combined with geometric
+        weights. Flagged channels are zeroed out.
+    output_array_config : Array64Config, optional
+        Layout used for SNAP input ordering. Defaults to array_config.
+        Use this when the calibration data was taken with a different SNAP
+        board assignment than the current beamformer.
+    freq_config : FrequencyConfig, optional
+        Frequency configuration. Defaults to CASM 3072-channel setup.
+    freq_order : str
+        Output frequency ordering: "descending" (default, 469->375 MHz)
+        or "ascending" (375->469 MHz).
+
+    Returns
+    -------
+    CombinedWeights
+        Combined weights with full metadata.
+    """
+    # Wrap single pointing in list
+    if isinstance(pointing, StationaryPointing):
+        pointings = [pointing]
+    else:
+        pointings = list(pointing)
+
+    if output_array_config is None:
+        output_array_config = array_config
+    if freq_config is None:
+        freq_config = FrequencyConfig()
+
+    gen = SnapWeightsGenerator(
+        array_config, freq_config=freq_config,
+        output_array_config=output_array_config,
+    )
+
+    # Step 1: geometric weights for active antennas (descending freq)
+    stationary = gen._beamformer.compute_stationary_weights(
+        pointings=pointings, mode=BeamMode.COHERENT,
+    )
+    active_weights = stationary.weights  # (n_beams, n_active, n_chan)
+
+    # Step 2: apply calibration if provided
+    if cal_weights is not None:
+        active_weights = gen._apply_calibration_weights(active_weights, cal_weights)
+
+    n_beams = len(pointings)
+    n_chan = freq_config.n_chan
+    active_indices = array_config.active_indices
+
+    # Step 3: expand to 64 slots
+    weights_64 = np.zeros((n_beams, 64, n_chan), dtype=np.complex64)
+    for i, ant64_idx in enumerate(active_indices):
+        weights_64[:, ant64_idx, :] = active_weights[:, i, :]
+
+    # Step 4: reorder to SNAP input order
+    weights_snap = np.zeros((n_beams, 64, n_chan), dtype=np.complex64)
+    snap_mapping = output_array_config.snap_to_ant64
+    for snap_idx in range(64):
+        ant64_idx = snap_mapping[snap_idx]
+        if ant64_idx >= 0:
+            weights_snap[:, snap_idx, :] = weights_64[:, ant64_idx, :]
+
+    # Step 5: build frequencies (descending, matching geo convention)
+    frequencies_hz = freq_config.get_frequencies_hz()  # descending
+
+    # Step 6: build flags
+    flags = np.ones(n_chan, dtype=bool)
+    if cal_weights is not None:
+        cal_flags = cal_weights.flags
+        is_ascending = (
+            len(cal_weights.frequencies_hz) > 1
+            and cal_weights.frequencies_hz[1] > cal_weights.frequencies_hz[0]
+        )
+        if is_ascending:
+            flags = cal_flags[::-1].copy()  # flip to descending
+        else:
+            flags = cal_flags.copy()
+
+    # Step 7: flip to ascending if requested
+    actual_order = "descending"
+    if freq_order == "ascending":
+        weights_snap = weights_snap[:, :, ::-1]
+        frequencies_hz = frequencies_hz[::-1]
+        flags = flags[::-1]
+        actual_order = "ascending"
+
+    return CombinedWeights(
+        weights=weights_snap,
+        frequencies_hz=frequencies_hz,
+        flags=flags,
+        pointings=pointings,
+        array_config=array_config,
+        output_array_config=output_array_config,
+        freq_config=freq_config,
+        cal_weights=cal_weights,
+        freq_order=actual_order,
+    )
 
 
 def generate_beam_grid(
@@ -405,21 +810,25 @@ def generate_beam_grid(
     alt_max_deg: float = 90.0,
     az_min_deg: float = 0.0,
     az_max_deg: float = 360.0,
+    positions_enu: Optional[np.ndarray] = None,
+    array_config: Optional['Array64Config'] = None,
+    freq_hz: Optional[float] = None,
 ) -> List[StationaryPointing]:
     """
     Generate a grid of beam pointings covering the sky.
 
-    The grid is generated with uniform spacing in altitude, and azimuth
-    spacing adjusted at each altitude to maintain roughly uniform sky coverage
-    (fewer azimuth beams near zenith where the circles are smaller).
+    The grid is generated with spacing in altitude and azimuth adjusted at
+    each altitude to maintain roughly uniform sky coverage. Supports both
+    isotropic and elliptical (array-aware) beam spacing.
 
     Parameters
     ----------
     n_beams : int, optional
-        Target number of beams. If specified, spacing_deg is computed
+        Target number of beams. If specified, spacing is scaled
         automatically to achieve approximately this many beams.
     spacing_deg : float
-        Beam spacing in degrees (default: 15.0). Ignored if n_beams is specified.
+        Isotropic beam spacing in degrees (default: 15.0). Ignored if
+        n_beams is specified or if array positions are provided.
     alt_min_deg : float
         Minimum altitude in degrees (default: 30.0).
     alt_max_deg : float
@@ -428,6 +837,15 @@ def generate_beam_grid(
         Minimum azimuth in degrees (default: 0.0).
     az_max_deg : float
         Maximum azimuth in degrees (default: 360.0).
+    positions_enu : np.ndarray, optional
+        Antenna positions in ENU coordinates, shape (n_ant, 3). If provided,
+        auto-computes elliptical spacing from beam FWHM (lambda/D per axis).
+    array_config : Array64Config, optional
+        Array configuration. If provided, uses its active positions for
+        FWHM computation. Overrides ``positions_enu``.
+    freq_hz : float, optional
+        Reference frequency in Hz for FWHM computation (default: 437.5 MHz).
+        Only used when positions are provided.
 
     Returns
     -------
@@ -439,30 +857,45 @@ def generate_beam_grid(
     >>> beams = generate_beam_grid(n_beams=8)  # ~8 beams
     >>> beams = generate_beam_grid(spacing_deg=20)  # 20 deg spacing
     >>> beams = generate_beam_grid(n_beams=16, alt_min_deg=45)  # 16 beams above 45 deg
+    >>> # Array-aware elliptical spacing:
+    >>> from bf_weights_generator import Array64Config
+    >>> arr = Array64Config.from_csv("layout.csv")
+    >>> beams = generate_beam_grid(array_config=arr)
     """
-    # If n_beams specified, estimate spacing to achieve target count
-    if n_beams is not None:
-        # Approximate: solid angle covered = 2*pi*(1 - cos(90-alt_min))
-        # Each beam covers ~(spacing)^2 steradians
-        # So n_beams ~ solid_angle / beam_area
-        alt_min_rad = np.deg2rad(alt_min_deg)
-        solid_angle = 2 * np.pi * (1 - np.sin(alt_min_rad))  # steradians above alt_min
-        beam_area = (np.deg2rad(spacing_deg)) ** 2
-        estimated_n = solid_angle / beam_area
+    # Determine per-axis spacing from array positions if provided
+    if array_config is not None:
+        pos = array_config.active_positions
+        spacing_ew, spacing_ns = compute_beam_fwhm(pos, freq_hz=freq_hz)
+    elif positions_enu is not None:
+        spacing_ew, spacing_ns = compute_beam_fwhm(positions_enu, freq_hz=freq_hz)
+    else:
+        spacing_ew = spacing_deg
+        spacing_ns = spacing_deg
 
-        # Adjust spacing iteratively to get close to target
-        if n_beams > 1:
-            # Scale spacing to match target
+    # If n_beams specified, estimate scaling to achieve target count
+    if n_beams is not None:
+        alt_min_rad = np.deg2rad(alt_min_deg)
+        alt_max_rad = np.deg2rad(alt_max_deg)
+        solid_angle = 2 * np.pi * (np.sin(alt_max_rad) - np.sin(alt_min_rad))
+        beam_area = np.deg2rad(spacing_ew) * np.deg2rad(spacing_ns)
+        if beam_area > 0:
+            estimated_n = solid_angle / beam_area
+        else:
+            estimated_n = 1
+
+        if n_beams > 1 and estimated_n > 0:
             scale = np.sqrt(estimated_n / n_beams)
-            spacing_deg = spacing_deg * scale
+            spacing_ew = spacing_ew * scale
+            spacing_ns = spacing_ns * scale
             # Clamp to reasonable range
-            spacing_deg = max(5.0, min(60.0, spacing_deg))
+            spacing_ew = max(0.5, min(60.0, spacing_ew))
+            spacing_ns = max(0.5, min(60.0, spacing_ns))
 
     pointings = []
     beam_idx = 0
 
-    # Generate altitude levels
-    alt_values = np.arange(alt_min_deg, alt_max_deg + spacing_deg / 2, spacing_deg)
+    # Generate altitude levels (N-S spacing controls altitude step)
+    alt_values = np.arange(alt_min_deg, alt_max_deg + spacing_ns / 2, spacing_ns)
 
     for alt in alt_values:
         if alt > 90.0:
@@ -475,9 +908,9 @@ def generate_beam_grid(
             az_values = [0.0]
         else:
             # Circumference at this altitude: 2π * cos(alt)
-            # Number of beams: circumference / spacing
+            # Number of beams: circumference / spacing_ew
             cos_alt = np.cos(np.deg2rad(alt))
-            az_spacing = spacing_deg / cos_alt if cos_alt > 0.1 else 360.0
+            az_spacing = spacing_ew / cos_alt if cos_alt > 0.1 else 360.0
 
             # Handle partial azimuth range
             az_range = az_max_deg - az_min_deg

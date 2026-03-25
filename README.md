@@ -1,167 +1,92 @@
-# CASM Beamformer Weights Generator
+# bf_weights_generator
 
-Generate geometric beamformer weights for the CASM phased array at OVRO.
+Generate beamformer weights for the CASM phased array at OVRO. Takes calibration weights from `casm-svd-calibrate` and produces SNAP-ready weight files with geometric steering + delay calibration combined.
 
-## Installation
+## Install
 
 ```bash
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate
-
-# Install
+source ~/software/dev/casm_venvs/casm_offline_env/bin/activate
+cd /home/casm/software/dev/bf_weights_generator
 pip install -e ".[full]"
 ```
 
-**Dependencies:** numpy, h5py, astropy (optional)
+## How to generate beamforming weights
 
-## Quick Start: Generate SNAP Weights
-
-### Command Line
+### 1. Generate calibration weights (casm_calibrator)
 
 ```bash
-# Generate 8 beams covering the sky
-python examples/generate_snap_weights.py \
-    --layout casm_antenna_layout1.csv \
-    --output weights.h5 \
-    --n-beams 8
-
-# Custom beam spacing (degrees)
-python examples/generate_snap_weights.py \
-    --layout casm_antenna_layout1.csv \
-    --output weights.h5 \
-    --spacing 20
-
-# Specific beam positions (alt:az format)
-python examples/generate_snap_weights.py \
-    --layout casm_antenna_layout1.csv \
-    --output weights.h5 \
-    --beams "90:0,70:0,70:90,70:180"
-
-# Transit survey preset (8 beams for FRB search)
-python examples/generate_snap_weights.py \
-    --layout casm_antenna_layout1.csv \
-    --output weights.h5 \
-    --beams transit
+casm-svd-calibrate \
+  --data-dir /mnt/nvme3/data/casm/visibilities_64ant/ \
+  --obs 2026-03-20-05:55:45 \
+  --source sun \
+  --layout ~/software/dev/antenna_layouts/antenna_layout_mar21.csv \
+  --ref-ant 3 \
+  --time-start '2026-03-21 10:00:00' --time-end '2026-03-21 15:00:00' --time-tz US/Pacific \
+  --output cal_weights.npz \
+  --plots cal_diagnostics.pdf
 ```
 
+### 2. Generate 512-beam stationary weights (this repo)
+
+Tile the sky with 512 beams in alt-az, combining geometric steering with calibration delays, and quantize to int8 for the SNAP hardware:
 
 ```python
 from bf_weights_generator import (
-    Array64Config,
-    SnapWeightsGenerator,
-    generate_beam_grid,
-    save_int8_weights_hdf5,
+    Array64Config, load_calibration_weights,
+    save_int8_weights_hdf5, generate_beam_grid, SnapWeightsGenerator,
 )
 
-# Load antenna layout
-array = Array64Config.from_csv("casm_antenna_layout1.csv")
-gen = SnapWeightsGenerator(array)
+# Load antenna layout and calibration weights
+layout = Array64Config.from_csv("antenna_layout_mar21.csv")
+cal = load_calibration_weights("cal_weights.npz")
 
-# Generate beams and compute weights
-beams = generate_beam_grid(n_beams=8)
-weights = gen.compute_int8_weights(beams)
+# Generate 512 beams tiling the sky (alt-az grid)
+beams = generate_beam_grid(n_beams=512, array_config=layout)
 
-# Save
-save_int8_weights_hdf5(weights, "weights.h5")
+# Quantize to int8 and save for SNAP hardware
+gen = SnapWeightsGenerator(layout)
+int8_weights = gen.compute_int8_weights(beams, cal_weights=cal)
+save_int8_weights_hdf5(int8_weights, "weights_512beam.h5")
 ```
 
-## Standard Stationary Weights (13 antennas)
+## CLI Commands
 
-For the default 13-antenna array without SNAP reordering:
+### casm-bf-weights
 
-```python
-from bf_weights_generator import (
-    GeometricBeamformer, StationaryPointing, save_weights_hdf5
-)
-
-bf = GeometricBeamformer()
-
-pointings = [
-    StationaryPointing(alt_deg=90.0, az_deg=0.0, name="zenith"),
-    StationaryPointing(alt_deg=60.0, az_deg=45.0, name="ne60"),
-]
-
-weights = bf.compute_stationary_weights(pointings)  # (n_beams, 13, 3072)
-save_weights_hdf5(weights, "weights.h5")
-```
-
-## Reading Weight Files
-
-```python
-from bf_weights_generator import load_int8_weights_hdf5
-
-weights = load_int8_weights_hdf5("weights.h5")
-
-# Available attributes:
-weights.weights_int8      # (2, n_chan, 2, n_beams, 64) - raw int8 data
-weights.to_complex64()    # (n_beams, 64, n_chan) - complex64 conversion
-weights.frequencies_hz    # (n_chan,) - channel frequencies
-weights.pointings         # List[StationaryPointing] - beam directions
-weights.n_beams           # int - number of beams
-weights.n_channels        # int - number of channels
-weights.scale_factor      # float - quantization scale (127.0)
-weights.shape             # tuple - weights_int8 shape
-weights.freq_config       # FrequencyConfig object
-weights.array_config      # Array64Config with:
-#   .positions_enu        # (64, 3) - antenna positions
-#   .active_mask          # (64,) bool - which slots active
-#   .snap_to_ant64        # (64,) int - SNAP input to ant64 mapping
-#   .n_active             # int - number of active antennas
-```
-
-## Plotting Beams
+Read and inspect weight files.
 
 ```bash
-python examples/plot_beams.py --weights weights.h5 --output beams.png
+# Print summary (format, n_beams, n_channels, freq range)
+casm-bf-weights weights_512beam.h5
+
+# List all beam pointings (alt/az)
+casm-bf-weights weights_512beam.h5 --list-beams
+
+# Show details for a specific beam
+casm-bf-weights weights_512beam.h5 --beam 42
+
+# Full metadata dump
+casm-bf-weights weights_512beam.h5 --info
 ```
 
-## Beam Grid Options
+### casm-bf-plotter
 
-| Method | Example |
-|--------|---------|
-| Auto-spacing for N beams | `generate_beam_grid(n_beams=8)` |
-| Fixed spacing | `generate_beam_grid(spacing_deg=20.0)` |
-| Altitude limits | `generate_beam_grid(n_beams=8, alt_min_deg=45.0)` |
+Plot beam positions on a sky map (zenithal equidistant projection with FWHM ellipses).
 
+```bash
+# Plot beam layout
+casm-bf-plotter weights_512beam.h5 -o beam_layout.png
 
+# Custom frequency for FWHM calculation
+casm-bf-plotter weights_512beam.h5 --freq 400e6 -o beams_400mhz.png
+```
 
-## CSV Layout Format
-
-Your antenna layout CSV needs these columns:
-
-| Column | Description |
-|--------|-------------|
-| `ant64` | Slot index (0-63) |
-| `x_east_m`, `y_north_m`, `z_up_m` | ENU coordinates |
-| `snap_A`, `adc_A` | SNAP board and ADC channel |
-| `include_in_beamforming` | Boolean |
-| `pos_type` | Must be "antenna" |
-
-## Output Format
-
-**Shape:** `(2, n_chan, 2, n_beams, 64)`
-
-| Axis | Meaning |
-|------|---------|
-| 0 | Real/Imaginary (0=real, 1=imag) |
-| 1 | Channels (reversed, low-to-high) |
-| 2 | Polarization (both identical) |
-| 3 | Beams |
-| 4 | Antennas (SNAP input order) |
-
-
-## Running Tests
+## Testing
 
 ```bash
 pytest tests/ -v
 ```
 
-## TODO
+## Detailed API reference
 
-- Tracking beams (follow RA/Dec sources)
-- Cable delay calibration integration
-
-## License
-
-MIT
+See [docs/api_reference.md](docs/api_reference.md) for the full Python API, output formats, CSV layout spec, and weight file structure.
