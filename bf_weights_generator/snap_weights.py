@@ -196,7 +196,7 @@ class Int8StationaryWeights:
     The weights are stored in the format expected by SNAP hardware:
     - Shape: (2, n_chan, 2, n_beams, 64) = (real/imag, chan, pol, beam, ant)
     - Antenna dimension is in SNAP input order
-    - Channels are in reversed order (low-to-high frequency)
+    - Channels are in descending frequency order (high-to-low, native SNAP order)
 
     Attributes
     ----------
@@ -584,12 +584,9 @@ class SnapWeightsGenerator:
                 weights_snap_order[:, snap_idx, :] = weights_64[:, ant64_idx, :]
             # else: stays zero (inactive SNAP input)
 
-        # Step 4: Reverse channel order
-        weights_reversed = weights_snap_order[:, :, ::-1]
-
         # Step 5: Quantize to int8
-        real_scaled = np.round(weights_reversed.real * scale_factor)
-        imag_scaled = np.round(weights_reversed.imag * scale_factor)
+        real_scaled = np.round(weights_snap_order.real * scale_factor)
+        imag_scaled = np.round(weights_snap_order.imag * scale_factor)
         real_int8 = np.clip(real_scaled, -128, 127).astype(np.int8)
         imag_int8 = np.clip(imag_scaled, -128, 127).astype(np.int8)
 
@@ -608,8 +605,8 @@ class SnapWeightsGenerator:
         # Shape: (2, n_chan, 2, n_beams, 64)
         weights_int8 = np.stack([real_with_pol, imag_with_pol], axis=0)
 
-        # Compute reversed frequencies
-        frequencies_hz = self.freq_config.get_frequencies_hz()[::-1]
+        # Frequencies in native descending order (high-to-low, matching SNAP hardware)
+        frequencies_hz = self.freq_config.get_frequencies_hz()
 
         return Int8StationaryWeights(
             weights_int8=weights_int8,

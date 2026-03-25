@@ -59,6 +59,7 @@ KNOWN_SOURCES = {
     "cas-a": SkyCoord(ra="23h23m24.00s", dec="+58d48m54.0s"),
     "cyg-a": SkyCoord(ra="19h59m28.36s", dec="+40d44m02.1s"),
     "vir-a": SkyCoord(ra="12h30m49.42s", dec="+12d23m28.0s"),
+    "b0329+54": SkyCoord(ra="03h32m59.4096s", dec="+54d34m43.329s"),
 }
 
 OVRO = EarthLocation(
