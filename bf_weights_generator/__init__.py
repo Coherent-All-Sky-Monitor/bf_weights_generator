@@ -65,8 +65,32 @@ Quick Start
 >>> stationary = bf.compute_stationary_weights(pointings)
 """
 
-__version__ = "0.2.0"
+from typing import TypedDict
+
+import numpy as np
+
+
+__version__ = "0.3.0"
 __author__ = "CASM Team"
+
+
+class BFWeights(TypedDict, total=False):
+    """Beamforming-weights container.
+
+    Returned by ``generate_bf_weights`` (forthcoming) and accepted by
+    ``deploy_bf_weights`` / ``inspect_snap_weights`` /
+    ``plot_source_transit``. Compose-friendly TypedDict; the legacy
+    HDF5/NPZ loaders return rich objects that are convertible to this
+    dict via ``.to_bfweights_dict()`` (planned).
+    """
+    int8_weights: np.ndarray
+    freqs_hz: np.ndarray
+    ant64_to_snap: np.ndarray
+    snap_to_ant64: np.ndarray
+    active_mask: np.ndarray
+    source: str
+    cal_source_path: str
+    layout_version: dict
 
 # Core classes
 from .weights import (
@@ -133,6 +157,9 @@ from .snap_weights import (
     generate_beam_grid,
 )
 
+# Compose-friendly inspect API (Phase 4)
+from .inspect import inspect_snap_weights
+
 __all__ = [
     # Version
     "__version__",
@@ -186,4 +213,7 @@ __all__ = [
     "TRANSIT_SURVEY_BEAMS",
     "parse_beams_arg",
     "generate_beam_grid",
+    # Compose API (Phase 4)
+    "BFWeights",
+    "inspect_snap_weights",
 ]
