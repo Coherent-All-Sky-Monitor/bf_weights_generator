@@ -151,6 +151,58 @@ class Array64Config:
             csv_path=csv_path,
         )
 
+    @classmethod
+    def from_antenna_mapping(cls, ant) -> "Array64Config":
+        """Build from a ``casm_io.AntennaMapping``.
+
+        The dated layout CSV that ``casm-build-layout`` writes uses a
+        different schema than ``from_csv`` expects (``antenna`` vs
+        ``ant64``, ``x``/``y``/``z`` vs ``x_east_m``/..., int 0/1 vs
+        the string ``"true"`` for ``include_in_beamforming``). Rather
+        than re-read the CSV and rename columns, accept the in-memory
+        AntennaMapping directly. Honours ``with_inactive`` overrides.
+
+        ``ant64`` slots are assigned in active-antenna order. ``snap``
+        and ``adc`` come from ``ant.snap_adc()`` (Pol A only — antennas
+        whose ``snap*12+adc`` falls outside [0, 64) are positioned but
+        not given a SNAP slot, same as ``from_csv``).
+        """
+        active = sorted(ant.active_antennas())
+        df = ant.dataframe
+
+        positions_enu = np.zeros((64, 3), dtype=np.float64)
+        active_mask = np.zeros(64, dtype=bool)
+        snap_to_ant64 = np.full(64, -1, dtype=np.int32)
+        ant64_to_snap = np.full(64, -1, dtype=np.int32)
+        pos_ids: List[str] = [""] * 64
+
+        for ant64_idx, aid in enumerate(active):
+            if ant64_idx >= 64:
+                break
+            row = df.loc[df["antenna_id"] == aid].iloc[0]
+            positions_enu[ant64_idx] = [
+                float(row["x_m"]), float(row["y_m"]), float(row["z_m"])
+            ]
+            active_mask[ant64_idx] = True
+            r = row.get("row", "") if "row" in df.columns else ""
+            c = row.get("col", "") if "col" in df.columns else ""
+            pos_ids[ant64_idx] = (f"{r}{c}" if r and c else f"ANT{aid}")
+
+            snap, adc = ant.snap_adc(aid)
+            snap_input_idx = int(snap) * 12 + int(adc)
+            if 0 <= snap_input_idx < 64:
+                snap_to_ant64[snap_input_idx] = ant64_idx
+                ant64_to_snap[ant64_idx] = snap_input_idx
+
+        return cls(
+            positions_enu=positions_enu,
+            active_mask=active_mask,
+            snap_to_ant64=snap_to_ant64,
+            ant64_to_snap=ant64_to_snap,
+            pos_ids=pos_ids,
+            csv_path="<from AntennaMapping>",
+        )
+
     @property
     def n_active(self) -> int:
         """Number of active (installed) antennas."""
