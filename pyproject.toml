@@ -61,6 +61,7 @@ bf-weights = "bf_weights_generator.cli:main"
 casm-bf-weights = "bf_weights_generator.read_cli:read_main"
 casm-bf-plotter = "bf_weights_generator.plot_cli:plot_main"
 casm-bf-inspect = "bf_weights_generator.inspect:main"
+casm-bf-source-transit = "bf_weights_generator.plot_transit:main"
 
 [project.urls]
 Homepage = "https://github.com/casm-team/bf_weights_generator"

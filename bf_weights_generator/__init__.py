@@ -157,8 +157,9 @@ from .snap_weights import (
     generate_beam_grid,
 )
 
-# Compose-friendly inspect API (Phase 4)
+# Compose-friendly inspect / source-transit APIs (Phase 4)
 from .inspect import inspect_snap_weights
+from .plot_transit import plot_source_transit
 
 __all__ = [
     # Version
@@ -216,4 +217,5 @@ __all__ = [
     # Compose API (Phase 4)
     "BFWeights",
     "inspect_snap_weights",
+    "plot_source_transit",
 ]
