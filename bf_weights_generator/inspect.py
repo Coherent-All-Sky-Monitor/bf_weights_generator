@@ -130,8 +130,17 @@ def _print_summary(info):
     print(f"Compute layout (stored): {info['compute_layout']}")
     print(f"Output layout (SNAP map): {info['output_layout']}")
     print()
-    print(f"Beams: {info['n_beams']}; alt range "
-          f"{min(info['beam_alt_deg']):.1f}° – {max(info['beam_alt_deg']):.1f}°")
+    print(f"Beams: {info['n_beams']}")
+    print(f"  alt range: {min(info['beam_alt_deg']):.1f}° – "
+          f"{max(info['beam_alt_deg']):.1f}°")
+    print(f"  az  range: {min(info['beam_az_deg']):.1f}° – "
+          f"{max(info['beam_az_deg']):.1f}°")
+    if info['n_beams'] <= 8:
+        print("  detail (alt°, az°):")
+        for n, alt, az in zip(info['beam_names'],
+                              info['beam_alt_deg'],
+                              info['beam_az_deg']):
+            print(f"    {n!r:<22s}  ({alt:6.2f}, {az:6.2f})")
     print()
     print(f"{'PktIdx':>7s} {'SNAP':>5s} {'ADC':>3s}  {'Ant64':>5s} "
           f"{'Pos ID':<10s} {'E(m)':>6s} {'N(m)':>6s}  {'Non-zero':>8s}")
