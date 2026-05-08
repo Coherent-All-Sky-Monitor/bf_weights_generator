@@ -296,12 +296,21 @@ class CalibrationWeights:
 
 def load_calibration_weights(npz_path: str) -> CalibrationWeights:
     """
-    Load SVD calibration weights from .npz file.
+    Load SVD calibration weights from a calibration file.
+
+    Format is auto-detected from the extension:
+
+    * ``.h5`` / ``.hdf5``: HDF5 with top-level datasets ``weights``,
+      ``flags``, ``ant_ids``, ``freqs_hz`` (or ``freqs_mhz``), plus
+      ``ref_ant_id`` and ``source`` as file attrs. Written by
+      ``casm_calibrator.save_calibration``.
+    * ``.npz`` (legacy): produced by the original SVD calibration pipeline.
 
     Parameters
     ----------
     npz_path : str
-        Path to the .npz file produced by the SVD calibration pipeline.
+        Path to the calibration file. The argument keeps its original
+        name for backwards compatibility; HDF5 paths work too.
 
     Returns
     -------
@@ -315,6 +324,60 @@ def load_calibration_weights(npz_path: str) -> CalibrationWeights:
     FileNotFoundError
         If the file does not exist.
     """
+    from pathlib import Path
+    p = Path(npz_path)
+    ext = p.suffix.lower()
+
+    if ext in (".h5", ".hdf5"):
+        import h5py
+        with h5py.File(p, "r") as f:
+            weights = f["weights"][:]
+            flags = f["flags"][:]
+            ant_ids = f["ant_ids"][:]
+            if "freqs_hz" in f:
+                frequencies_hz = f["freqs_hz"][:].astype(np.float64)
+            elif "freqs_mhz" in f:
+                frequencies_hz = f["freqs_mhz"][:].astype(np.float64) * 1e6
+            else:
+                raise ValueError(
+                    "Cal weights HDF5 must contain 'freqs_hz' or 'freqs_mhz'"
+                )
+            ref_ant_id = int(f.attrs.get("ref_ant_id", 0))
+            src_attr = f.attrs.get("source", "")
+            source = src_attr.decode() if isinstance(src_attr, bytes) else str(src_attr)
+
+        # validate + ascending fix below uses local variables already.
+        n_ant, n_chan = weights.shape
+        if len(flags) != n_chan:
+            raise ValueError(
+                f"Shape mismatch: weights has {n_chan} channels but flags has {len(flags)}"
+            )
+        if len(frequencies_hz) != n_chan:
+            raise ValueError(
+                f"Shape mismatch: weights has {n_chan} channels but frequencies has "
+                f"{len(frequencies_hz)}"
+            )
+        if len(ant_ids) != n_ant:
+            raise ValueError(
+                f"Shape mismatch: weights has {n_ant} antennas but ant_ids has "
+                f"{len(ant_ids)}"
+            )
+
+        if n_chan > 1 and frequencies_hz[1] < frequencies_hz[0]:
+            frequencies_hz = frequencies_hz[::-1]
+            weights = weights[:, ::-1]
+            flags = flags[::-1]
+
+        return CalibrationWeights(
+            weights=weights,
+            flags=flags,
+            frequencies_hz=frequencies_hz,
+            ant_ids=ant_ids,
+            ref_ant_id=ref_ant_id,
+            source=source,
+        )
+
+    # NPZ path (legacy)
     data = np.load(npz_path, allow_pickle=True)
 
     weights = data['weights']
