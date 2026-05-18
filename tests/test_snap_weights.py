@@ -62,22 +62,50 @@ class TestArray64Config:
         return Array64Config.from_csv(str(CSV_LAYOUT2))
 
     def test_parse_layout1(self, layout1):
-        """Test parsing casm_antenna_layout1.csv."""
-        # Should have 12 active antennas (excluding out-trigger)
-        assert layout1.n_active == 12
-        assert layout1.positions_enu.shape == (64, 3)
-        assert layout1.active_mask.shape == (64,)
-        assert np.sum(layout1.active_mask) == 12
+        """Test parsing casm_antenna_layout1.csv.
+
+        After the v2 refactor an antenna only counts as active if it has
+        SNAP wiring (snap_A and adc_A populated). The legacy fixture has
+        12 antennas marked include_in_beamforming=True; one of them
+        (N21_E04, ant64=3) has empty snap_A/adc_A so it's not assignable
+        to any SNAP input. Net active = 11.
+        """
+        assert layout1.n_active == 11
+        # 6 SNAPs * 12 ADCs = 72 slots in the default slot_table view.
+        assert layout1.positions_enu.shape == (72, 3)
+        assert layout1.active_mask.shape == (72,)
+        assert np.sum(layout1.active_mask) == 11
 
     def test_parse_layout2(self, layout2):
         """Test parsing casm_antenna_layout2.csv."""
-        assert layout2.n_active == 12
-        assert layout2.positions_enu.shape == (64, 3)
+        # Same SNAP-wiring constraint as layout1.
+        assert layout2.n_active == 11
+        assert layout2.positions_enu.shape == (72, 3)
 
-    def test_active_indices(self, layout1):
-        """Test that active indices are 0-11."""
-        expected = np.arange(12)
-        np.testing.assert_array_equal(layout1.active_indices, expected)
+    def test_active_indices_are_snap_input_indices(self, layout1):
+        """active_indices now returns snap_input_idx values directly.
+
+        For layout1, each active antenna's snap_input_idx is
+        snap_A * 12 + adc_A. Verify the set matches what the CSV says.
+        """
+        # CSV gives snap_A/adc_A for each ant64=0..11 (one is unwired).
+        # Compute expected snap_input_idx values from the CSV directly.
+        import csv as _csv
+        from pathlib import Path as _Path
+        csv_path = _Path(layout1.csv_path)
+        expected = []
+        with open(csv_path, newline='') as f:
+            for row in _csv.DictReader(f):
+                if row.get('pos_type', '').strip().lower() != 'antenna':
+                    continue
+                if row.get('include_in_beamforming', '').strip().lower() != 'true':
+                    continue
+                snap_a = row.get('snap_A', '').strip()
+                adc_a = row.get('adc_A', '').strip()
+                if not snap_a or not adc_a:
+                    continue
+                expected.append(int(float(snap_a)) * 12 + int(float(adc_a)))
+        np.testing.assert_array_equal(layout1.active_indices, sorted(expected))
 
     def test_inactive_positions_zero(self, layout1):
         """Test that inactive positions are all zeros."""
@@ -85,33 +113,47 @@ class TestArray64Config:
         inactive_positions = layout1.positions_enu[inactive_mask]
         np.testing.assert_array_equal(inactive_positions, 0.0)
 
-    def test_snap_ordering(self, layout1):
-        """Test SNAP input ordering is computed correctly."""
-        # Check that snap_to_ant64 and ant64_to_snap are inverses
-        for snap_idx in range(64):
-            ant64_idx = layout1.snap_to_ant64[snap_idx]
-            if ant64_idx >= 0:
-                # If this SNAP input maps to an antenna, verify reverse mapping
-                assert layout1.ant64_to_snap[ant64_idx] == snap_idx
+    def test_antenna_ids_at_snap_inputs(self, layout1):
+        """antenna_ids[snap_input_idx] gives the real antenna_id at that slot.
+
+        Replaces the legacy snap_to_ant64/ant64_to_snap dual map with a
+        single antenna_id-per-slot lookup.
+        """
+        # The fixture uses antenna_id == ant64 + 1 (set by the legacy
+        # CSV translator). For the active set, antenna_ids should be
+        # 1-indexed and unique.
+        active_ids = layout1.antenna_ids[layout1.active_mask]
+        assert (active_ids > 0).all(), "active slots must have real antenna IDs"
+        assert len(np.unique(active_ids)) == len(active_ids), \
+            "no duplicate antenna IDs across active slots"
+        # Inactive slots are -1.
+        assert (layout1.antenna_ids[~layout1.active_mask] == -1).all()
 
     def test_snap_input_calculation(self, layout1):
-        """Test that SNAP input index = snap_board * 12 + adc_channel."""
-        # From CSV: ant64=0 has snap_A=0, adc_A=8 -> snap_input = 8
-        # Check that snap_to_ant64[8] == 0
-        assert layout1.snap_to_ant64[8] == 0
+        """snap_input_idx = snap_board*12 + adc_channel.
+
+        From CSV: N21_E01 has snap_A=0, adc_A=8 → snap_input_idx=8 →
+        antenna_ids[8] == 1 (it's the first row, ant64=0 → antenna_id=1).
+        """
+        assert layout1.antenna_ids[8] == 1
+        assert layout1.active_mask[8]
 
     def test_to_array_config(self, layout1):
         """Test conversion to ArrayConfig."""
         arr_config = layout1.to_array_config()
-        assert arr_config.n_antennas == 12
-        assert arr_config.n_active_antennas == 12
-        assert arr_config.positions_enu.shape == (12, 3)
+        assert arr_config.n_antennas == 11
+        assert arr_config.n_active_antennas == 11
+        assert arr_config.positions_enu.shape == (11, 3)
 
     def test_pos_ids_stored(self, layout1):
-        """Test that position IDs are stored."""
-        assert len(layout1.pos_ids) == 64
-        # First active antenna should have a pos_id
-        assert layout1.pos_ids[0] == "N21_E01"
+        """Test that position IDs are stored at SNAP-input slots."""
+        # 72 slots in the default slot_table view (6 SNAPs * 12 ADCs).
+        assert len(layout1.pos_ids) == 72
+        # The first active antenna in the CSV is N21_E01 at snap_input_idx=8.
+        # pos_ids[8] should be a non-empty label derived from row/col.
+        # The legacy translator doesn't carry row/col, so the fallback
+        # label is "ANT<antenna_id>" — antenna 1 lives at slot 8.
+        assert layout1.pos_ids[8] == "ANT1"
 
 
 class TestSnapWeightsGenerator:
@@ -128,8 +170,9 @@ class TestSnapWeightsGenerator:
     def test_compute_default_beams(self, generator):
         """Test computing weights with default transit survey beams."""
         weights = generator.compute_int8_weights()
+        n_slots = len(generator.array_config.positions_enu)  # 72 for 6×12
         assert weights.n_beams == 8
-        assert weights.weights_int8.shape == (2, 3072, 2, 8, 64)
+        assert weights.weights_int8.shape == (2, 3072, 2, 8, n_slots)
 
     def test_compute_custom_beams(self, generator):
         """Test computing weights with custom beams."""
@@ -138,41 +181,32 @@ class TestSnapWeightsGenerator:
             StationaryPointing(alt_deg=60.0, az_deg=45.0, name="ne"),
         ]
         weights = generator.compute_int8_weights(pointings)
+        n_slots = len(generator.array_config.positions_enu)  # 72 for 6×12
         assert weights.n_beams == 2
-        assert weights.weights_int8.shape == (2, 3072, 2, 2, 64)
+        assert weights.weights_int8.shape == (2, 3072, 2, 2, n_slots)
 
     def test_inactive_antennas_zero(self, generator):
-        """Test that inactive antennas have zero weights."""
+        """Test that inactive SNAP inputs have zero weights."""
         weights = generator.compute_int8_weights()
-
-        # Find inactive SNAP inputs
-        active_snap_inputs = set()
-        for snap_idx in range(64):
-            if generator.array_config.snap_to_ant64[snap_idx] >= 0:
-                active_snap_inputs.add(snap_idx)
-
-        # Check that inactive SNAP inputs have all-zero weights
-        for snap_idx in range(64):
-            if snap_idx not in active_snap_inputs:
+        active_set = set(int(i) for i in generator.array_config.active_indices)
+        # Iterate over the full slot count (n_snaps × n_adc = 72 for 6×12).
+        n_slots = len(generator.array_config.positions_enu)
+        for snap_idx in range(n_slots):
+            if snap_idx not in active_set:
                 real = weights.weights_int8[0, :, :, :, snap_idx]
                 imag = weights.weights_int8[1, :, :, :, snap_idx]
                 assert np.all(real == 0), f"SNAP input {snap_idx} should be zero (real)"
                 assert np.all(imag == 0), f"SNAP input {snap_idx} should be zero (imag)"
 
     def test_active_antennas_nonzero(self, generator):
-        """Test that active antennas have non-zero weights."""
+        """Test that active SNAP inputs have non-zero weights."""
         weights = generator.compute_int8_weights()
-
-        active_snap_inputs = set()
-        for snap_idx in range(64):
-            if generator.array_config.snap_to_ant64[snap_idx] >= 0:
-                active_snap_inputs.add(snap_idx)
-
-        # Check that at least some active SNAP inputs have non-zero weights
-        for snap_idx in active_snap_inputs:
+        n_slots = len(generator.array_config.positions_enu)
+        for snap_idx in generator.array_config.active_indices:
+            if snap_idx >= n_slots:
+                continue   # outside the int8 output (shouldn't happen)
             real = weights.weights_int8[0, :, :, :, snap_idx]
             imag = weights.weights_int8[1, :, :, :, snap_idx]
-            # Complex weights should have |w|=1, so real^2 + imag^2 should be non-zero
             assert np.any(real != 0) or np.any(imag != 0), \
                 f"Active SNAP input {snap_idx} should have non-zero weights"
 
@@ -213,11 +247,11 @@ class TestQuantizationRoundtrip:
         # The magnitude should be close to 1 for coherent beams
         magnitudes = np.abs(complex_weights)
 
-        # Only check active antennas
-        active_snap_inputs = []
-        for snap_idx in range(64):
-            if weights.array_config.snap_to_ant64[snap_idx] >= 0:
-                active_snap_inputs.append(snap_idx)
+        # Only check active SNAP inputs (slot indices within the output).
+        n_slots = len(weights.array_config.positions_enu)
+        active_snap_inputs = [
+            int(i) for i in weights.array_config.active_indices if int(i) < n_slots
+        ]
 
         for snap_idx in active_snap_inputs:
             mags = magnitudes[:, snap_idx, :]
@@ -252,7 +286,8 @@ class TestInt8WeightsIO:
             assert loaded.n_beams == weights.n_beams
             assert loaded.n_channels == weights.n_channels
 
-            # Check array config
+            # Check array config (v2.0 schema: antenna_ids replaces the
+            # snap_to_ant64/ant64_to_snap reorder maps).
             np.testing.assert_array_equal(
                 loaded.array_config.positions_enu,
                 weights.array_config.positions_enu
@@ -262,8 +297,8 @@ class TestInt8WeightsIO:
                 weights.array_config.active_mask
             )
             np.testing.assert_array_equal(
-                loaded.array_config.snap_to_ant64,
-                weights.array_config.snap_to_ant64
+                loaded.array_config.antenna_ids,
+                weights.array_config.antenna_ids
             )
 
             # Check pointings
@@ -282,7 +317,7 @@ class TestInt8WeightsIO:
 
             assert info['n_beams'] == weights.n_beams
             assert info['n_channels'] == weights.n_channels
-            assert info['n_antennas'] == 64
+            assert info['n_antennas'] == len(weights.array_config.positions_enu)
             assert info['n_pol'] == 2
             assert info['scale_factor'] == weights.scale_factor
             assert info['weights_shape'] == weights.shape
@@ -754,18 +789,19 @@ class TestCombinedWeights:
         pointings = [StationaryPointing(alt_deg=90.0, az_deg=0.0, name="zenith")]
 
         combined = gen.compute_int8_weights(pointings, cal_weights=cal)
-        complex_w = combined.to_complex64()  # (n_beams, 64, n_chan) SNAP order
+        complex_w = combined.to_complex64()  # (n_beams, n_slots, n_chan) SNAP order
+        n_slots = len(pre_feb16.positions_enu)
 
         # At zenith all geometric delays are zero, so geo weights = 1+0j.
         # Combined = cal * 1 = cal. Check phase agreement for active antennas.
         # SNAP output reverses geo (desc→asc), cal was flipped desc for multiply
         # then reversed back → SNAP channel i = cal channel i (both ascending).
-        active_indices = pre_feb16.active_indices
-        for i, ant64 in enumerate(active_indices):
-            snap_idx = pre_feb16.ant64_to_snap[ant64]
-            if snap_idx < 0:
+        for snap_idx in pre_feb16.active_indices:
+            snap_idx = int(snap_idx)
+            if snap_idx >= n_slots:
                 continue
-            cal_ant_idx = np.where(cal.ant_ids - 1 == ant64)[0]
+            aid = int(pre_feb16.antenna_ids[snap_idx])
+            cal_ant_idx = np.where(cal.ant_ids == aid)[0]
             if len(cal_ant_idx) == 0:
                 continue
             cal_ant_idx = cal_ant_idx[0]
@@ -780,7 +816,7 @@ class TestCombinedWeights:
                 # Tolerance 0.2 rad: accounts for int8 quantization and
                 # small z-offsets creating residual frequency-dependent phase
                 assert np.std(phase_diff) < 0.2, (
-                    f"Phase mismatch for ant64={ant64}: "
+                    f"Phase mismatch for antenna {aid} (snap_idx={snap_idx}): "
                     f"std(phase_diff)={np.std(phase_diff):.3f}"
                 )
 
@@ -796,9 +832,10 @@ class TestCombinedWeights:
 
         # Flagged channels should be zero for all active SNAP inputs
         n_checked = 0
-        for snap_idx in range(64):
-            ant64 = pre_feb16.snap_to_ant64[snap_idx]
-            if ant64 < 0:
+        n_slots = len(pre_feb16.positions_enu)
+        for snap_idx in pre_feb16.active_indices:
+            snap_idx = int(snap_idx)
+            if snap_idx >= n_slots:
                 continue
             for fi in flagged:
                 real = combined.weights_int8[0, fi, 0, 0, snap_idx]
@@ -816,20 +853,20 @@ class TestCombinedWeights:
         pointings = [StationaryPointing(alt_deg=90.0, az_deg=0.0, name="zenith")]
         combined = gen.compute_int8_weights(pointings, cal_weights=cal)
 
-        # Verify SNAP ordering uses current layout's mapping
-        assert combined.shape[4] == 64
-        # Active antennas according to current layout should be non-zero
-        for snap_idx in range(64):
-            ant64 = current_layout.snap_to_ant64[snap_idx]
-            if ant64 >= 0 and pre_feb16.active_mask[ant64]:
-                # This antenna has weights computed (from pre_feb16) and should
-                # appear at the current layout's SNAP position
-                w = combined.weights_int8[:, :, :, :, snap_idx]
-                # At least some channels should be non-zero (unflagged)
-                assert np.any(w != 0), (
-                    f"SNAP input {snap_idx} (ant64={ant64}) should have "
-                    f"non-zero weights"
-                )
+        # Verify shape and that the compute layout's active SNAP inputs
+        # carry non-zero weights. Now that there's no separate ant64
+        # reorder, output_array_config doesn't change which slots get
+        # written — it just records provenance.
+        n_slots = len(pre_feb16.positions_enu)
+        assert combined.shape[4] == n_slots
+        for snap_idx in pre_feb16.active_indices:
+            snap_idx = int(snap_idx)
+            if snap_idx >= n_slots:
+                continue
+            w = combined.weights_int8[:, :, :, :, snap_idx]
+            assert np.any(w != 0), (
+                f"SNAP input {snap_idx} should have non-zero weights"
+            )
 
     def test_channel_count_mismatch_raises(self, pre_feb16):
         """Cal weights with different channel count should raise ValueError."""
@@ -893,17 +930,18 @@ class TestGenerateCombinedWeights:
         return load_calibration_weights(str(CAL_WEIGHTS_PATH))
 
     def test_single_pointing(self, pre_feb16):
-        """Single StationaryPointing produces shape (1, 64, n_chan)."""
+        """Single StationaryPointing produces shape (1, n_slots, n_chan)."""
         result = generate_combined_weights(
             pointing=StationaryPointing(alt_deg=90.0, az_deg=0.0),
             array_config=pre_feb16,
         )
+        n_slots = len(pre_feb16.positions_enu)  # 72 for current 6×12 hw
         assert isinstance(result, CombinedWeights)
-        assert result.weights.shape == (1, 64, 3072)
+        assert result.weights.shape == (1, n_slots, 3072)
         assert result.weights.dtype == np.complex64
 
     def test_multi_pointing(self, pre_feb16):
-        """List of pointings produces shape (N, 64, n_chan)."""
+        """List of pointings produces shape (N, n_slots, n_chan)."""
         pointings = [
             StationaryPointing(alt_deg=90.0, az_deg=0.0, name="zenith"),
             StationaryPointing(alt_deg=70.0, az_deg=90.0, name="east"),
@@ -912,7 +950,8 @@ class TestGenerateCombinedWeights:
         result = generate_combined_weights(
             pointing=pointings, array_config=pre_feb16,
         )
-        assert result.weights.shape == (3, 64, 3072)
+        n_slots = len(pre_feb16.positions_enu)  # 72 for current 6×12 hw
+        assert result.weights.shape == (3, n_slots, 3072)
         assert result.n_beams == 3
 
     def test_with_cal(self, pre_feb16, cal):
@@ -924,9 +963,7 @@ class TestGenerateCombinedWeights:
         )
         assert result.cal_weights is not None
         # Check magnitudes of active antennas on good channels
-        active_snaps = [
-            si for si in range(64) if pre_feb16.snap_to_ant64[si] >= 0
-        ]
+        active_snaps = [int(i) for i in pre_feb16.active_indices if int(i) < 64]
         good = result.flags
         mags = np.abs(result.weights[0, active_snaps, :][:, good])
         nonzero = mags > 0.01
@@ -941,9 +978,7 @@ class TestGenerateCombinedWeights:
         )
         assert result.cal_weights is None
         assert np.all(result.flags)  # All channels good
-        active_snaps = [
-            si for si in range(64) if pre_feb16.snap_to_ant64[si] >= 0
-        ]
+        active_snaps = [int(i) for i in pre_feb16.active_indices if int(i) < 64]
         mags = np.abs(result.weights[0, active_snaps, :])
         np.testing.assert_allclose(mags, 1.0, atol=1e-5)
 
@@ -957,11 +992,12 @@ class TestGenerateCombinedWeights:
         )
         assert result.output_array_config is current_layout
         assert result.array_config is pre_feb16
-        # Active antennas per current layout should have non-zero weights
-        for snap_idx in range(64):
-            ant64 = current_layout.snap_to_ant64[snap_idx]
-            if ant64 >= 0 and pre_feb16.active_mask[ant64]:
-                assert np.any(result.weights[0, snap_idx, :] != 0)
+        # Active SNAP inputs in pre_feb16 (the compute layout) should
+        # have non-zero combined weights — the output layout argument
+        # is a no-op now that there's no separate ant64 reorder.
+        for snap_idx in pre_feb16.active_indices:
+            if int(snap_idx) < 64:
+                assert np.any(result.weights[0, int(snap_idx), :] != 0)
 
     def test_freq_order_default(self, pre_feb16):
         """Default freq_order is descending."""
@@ -1013,8 +1049,8 @@ class TestGenerateCombinedWeights:
                 result.array_config.positions_enu,
             )
             np.testing.assert_array_equal(
-                loaded.output_array_config.snap_to_ant64,
-                result.output_array_config.snap_to_ant64,
+                loaded.output_array_config.antenna_ids,
+                result.output_array_config.antenna_ids,
             )
             # Check cal weights fully round-tripped
             assert loaded.cal_weights is not None
@@ -1039,9 +1075,7 @@ class TestGenerateCombinedWeights:
         )
         flagged = ~result.flags
         assert np.any(flagged), "No flagged channels to test"
-        active_snaps = [
-            si for si in range(64) if pre_feb16.snap_to_ant64[si] >= 0
-        ]
+        active_snaps = [int(i) for i in pre_feb16.active_indices if int(i) < 64]
         for snap_idx in active_snaps:
             flagged_w = result.weights[0, snap_idx, flagged]
             np.testing.assert_array_equal(

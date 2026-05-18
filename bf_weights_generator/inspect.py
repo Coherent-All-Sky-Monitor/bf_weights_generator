@@ -56,7 +56,7 @@ def inspect_snap_weights(weights, layout=None, *, print_table=True):
         ``n_nonzero_snap_inputs`` (int <= 64),
         ``n_active_layout`` (int <= 64),
         ``snap_table`` (list of dicts with snap_idx, snap_board,
-        adc_ch, ant64, pos_id, east_m, north_m, has_data).
+        adc_ch, antenna_id, pos_id, east_m, north_m, has_data).
     """
     weights = Path(weights)
     with h5py.File(weights, "r") as f:
@@ -83,7 +83,7 @@ def inspect_snap_weights(weights, layout=None, *, print_table=True):
     for snap_idx in range(64):
         snap_board = snap_idx // 12
         adc_ch = snap_idx % 12
-        ant64 = int(output_cfg.snap_to_ant64[snap_idx])
+        antenna_id = int(output_cfg.antenna_ids[snap_idx])
         has_data = bool(np.any(w[:, :, 0, :, snap_idx] != 0))
         if has_data:
             n_nonzero += 1
@@ -91,13 +91,13 @@ def inspect_snap_weights(weights, layout=None, *, print_table=True):
             "snap_idx": snap_idx,
             "snap_board": snap_board,
             "adc_ch": adc_ch,
-            "ant64": ant64,
+            "antenna_id": antenna_id,
             "has_data": has_data,
         }
-        if ant64 >= 0 and bool(output_cfg.active_mask[ant64]):
-            row["pos_id"] = str(output_cfg.pos_ids[ant64])
-            row["east_m"] = float(output_cfg.positions_enu[ant64, 0])
-            row["north_m"] = float(output_cfg.positions_enu[ant64, 1])
+        if antenna_id >= 0 and bool(output_cfg.active_mask[snap_idx]):
+            row["pos_id"] = str(output_cfg.pos_ids[snap_idx])
+            row["east_m"] = float(output_cfg.positions_enu[snap_idx, 0])
+            row["north_m"] = float(output_cfg.positions_enu[snap_idx, 1])
         snap_table.append(row)
 
     info = {
@@ -142,14 +142,14 @@ def _print_summary(info):
                               info['beam_az_deg']):
             print(f"    {n!r:<22s}  ({alt:6.2f}, {az:6.2f})")
     print()
-    print(f"{'PktIdx':>7s} {'SNAP':>5s} {'ADC':>3s}  {'Ant64':>5s} "
+    print(f"{'PktIdx':>7s} {'SNAP':>5s} {'ADC':>3s}  {'AntID':>5s} "
           f"{'Pos ID':<10s} {'E(m)':>6s} {'N(m)':>6s}  {'Non-zero':>8s}")
     print("-" * 70)
     for row in info["snap_table"]:
         if "pos_id" in row:
             flag = "YES" if row["has_data"] else "---"
             print(f"{row['snap_idx']:>7d} {row['snap_board']:>5d} "
-                  f"{row['adc_ch']:>3d}  {row['ant64']:>5d} "
+                  f"{row['adc_ch']:>3d}  {row['antenna_id']:>5d} "
                   f"{row['pos_id']:<10s} {row['east_m']:>6.2f} "
                   f"{row['north_m']:>6.2f}  {flag:>8s}")
         elif row["has_data"]:

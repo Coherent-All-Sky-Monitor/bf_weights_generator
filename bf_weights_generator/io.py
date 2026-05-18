@@ -473,19 +473,24 @@ def save_int8_weights_hdf5(
 
     Notes
     -----
-    HDF5 structure:
+    HDF5 structure (schema v2.0):
         /
         ├── weights_int8          # int8, shape (2, n_chan, 2, n_beams, 64)
+        │                         #   axis 4 is in SNAP input order
+        │                         #   (snap_input_idx = snap_id * 12 + adc)
         ├── frequencies_hz        # float64, shape (n_chan,)
         ├── pointings/
         │   ├── alt_deg, az_deg   # float, shape (n_beams,)
         │   └── names             # string attribute
         ├── array_config/
-        │   ├── positions_enu     # float64, shape (64, 3)
-        │   ├── active_mask       # bool, shape (64,)
-        │   ├── snap_to_ant64     # int, shape (64,)
-        │   └── ant64_to_snap     # int, shape (64,)
+        │   ├── positions_enu     # float64, shape (64, 3) — by snap_input_idx
+        │   ├── active_mask       # bool,    shape (64,)   — by snap_input_idx
+        │   └── antenna_ids       # int,     shape (64,)   — real antenna_id at
+        │                         #   each snap_input_idx slot, -1 if unwired
         └── Attributes: scale_factor, n_beams, n_channels, n_pol, n_antennas
+
+    The reader supports v1.0 files (with the legacy ``snap_to_ant64`` /
+    ``ant64_to_snap`` datasets) and synthesizes ``antenna_ids`` on load.
     """
     _check_h5py()
 
@@ -501,14 +506,17 @@ def save_int8_weights_hdf5(
                          compression=compression, compression_opts=compression_opts)
         f.create_dataset('frequencies_hz', data=weights.frequencies_hz)
 
-        # Store root attributes
+        # Store root attributes.
+        # n_antennas mirrors the SNAP slot count (n_snaps * n_adc — 72 on
+        # current 6×12 hardware). Read from the array_config so that it
+        # tracks reality even if the slot count changes.
         f.attrs['scale_factor'] = weights.scale_factor
         f.attrs['n_beams'] = weights.n_beams
         f.attrs['n_channels'] = weights.n_channels
         f.attrs['n_pol'] = 2
-        f.attrs['n_antennas'] = 64
+        f.attrs['n_antennas'] = len(weights.array_config.positions_enu)
         f.attrs['created_utc'] = datetime.now(timezone.utc).isoformat()
-        f.attrs['version'] = '1.0'
+        f.attrs['version'] = '2.0'
         f.attrs['format_type'] = 'int8_snap_weights'
 
         # Store pointings
@@ -517,12 +525,13 @@ def save_int8_weights_hdf5(
         pt_grp.create_dataset('az_deg', data=[p.az_deg for p in weights.pointings])
         pt_grp.attrs['names'] = json.dumps([p.name for p in weights.pointings])
 
-        # Store array configuration
+        # Store array configuration (v2.0: antenna_ids replaces the two
+        # reorder maps because every internal index is already a
+        # snap_input_idx).
         arr_grp = f.create_group('array_config')
         arr_grp.create_dataset('positions_enu', data=weights.array_config.positions_enu)
         arr_grp.create_dataset('active_mask', data=weights.array_config.active_mask)
-        arr_grp.create_dataset('snap_to_ant64', data=weights.array_config.snap_to_ant64)
-        arr_grp.create_dataset('ant64_to_snap', data=weights.array_config.ant64_to_snap)
+        arr_grp.create_dataset('antenna_ids', data=weights.array_config.antenna_ids)
         arr_grp.attrs['csv_path'] = weights.array_config.csv_path
         arr_grp.attrs['pos_ids'] = json.dumps(weights.array_config.pos_ids)
 
@@ -571,16 +580,10 @@ def load_int8_weights_hdf5(filepath: Union[str, Path]):
             for alt, az, name in zip(alt_deg, az_deg, names)
         ]
 
-        # Load array configuration
+        # Load array configuration (supports v2.0 antenna_ids and v1.0
+        # legacy snap_to_ant64/ant64_to_snap reorder maps).
         arr_grp = f['array_config']
-        array_config = Array64Config(
-            positions_enu=arr_grp['positions_enu'][:],
-            active_mask=arr_grp['active_mask'][:],
-            snap_to_ant64=arr_grp['snap_to_ant64'][:],
-            ant64_to_snap=arr_grp['ant64_to_snap'][:],
-            pos_ids=json.loads(arr_grp.attrs['pos_ids']),
-            csv_path=arr_grp.attrs['csv_path'],
-        )
+        array_config = _array64_from_h5_group(arr_grp, Array64Config)
 
         # Load frequency configuration
         freq_grp = f['freq_config']
@@ -654,28 +657,67 @@ def inspect_int8_weights_file(filepath: Union[str, Path]) -> dict:
 # Combined Weights I/O (complex64 geo+cal)
 # =============================================================================
 
+def _array64_from_h5_group(grp, Array64ConfigCls):
+    """Construct Array64Config from an HDF5 group (v1.0 or v2.0).
+
+    v2.0 stores ``antenna_ids`` directly. v1.0 stored ``snap_to_ant64``
+    and ``ant64_to_snap`` reorder maps; we synthesize ``antenna_ids`` by
+    treating the legacy ``ant64`` slot index as ``antenna_id - 1`` (the
+    convention the v1.0 fixtures and tests used). This matches what the
+    pre-refactor pipeline did, so existing weights HDF5 files keep
+    loading correctly.
+    """
+    positions_enu = grp['positions_enu'][:]
+    active_mask = grp['active_mask'][:]
+    pos_ids = json.loads(grp.attrs['pos_ids'])
+    csv_path = grp.attrs.get('csv_path', '')
+
+    if 'antenna_ids' in grp:
+        antenna_ids = grp['antenna_ids'][:].astype(np.int32)
+    elif 'snap_to_ant64' in grp:
+        # v1.0 legacy: ant64 was an arbitrary slot; the convention used
+        # by every test fixture and by save_calibration's writer was
+        # antenna_id == ant64 + 1. Reconstruct on that basis. The legacy
+        # files were written at 64 slots; size the reconstructed array
+        # from the source dataset so we don't truncate.
+        snap_to_ant64 = grp['snap_to_ant64'][:]
+        n_slots = len(snap_to_ant64)
+        antenna_ids = np.full(n_slots, -1, dtype=np.int32)
+        # Walk SNAP inputs; the ant64 index at that input gives the
+        # antenna_id (after +1) that lives in this slot.
+        for snap_idx in range(n_slots):
+            ant64_idx = int(snap_to_ant64[snap_idx])
+            if ant64_idx >= 0:
+                antenna_ids[snap_idx] = ant64_idx + 1
+    else:
+        raise ValueError(
+            "array_config group has neither 'antenna_ids' (v2.0) nor "
+            "'snap_to_ant64' (v1.0); cannot reconstruct slot mapping."
+        )
+
+    return Array64ConfigCls(
+        positions_enu=positions_enu,
+        active_mask=active_mask,
+        antenna_ids=antenna_ids,
+        pos_ids=pos_ids,
+        csv_path=csv_path,
+    )
+
+
 def _save_array64_config_group(grp, config):
-    """Save Array64Config into an HDF5 group."""
+    """Save Array64Config into an HDF5 group (v2.0 schema)."""
     grp.create_dataset('positions_enu', data=config.positions_enu)
     grp.create_dataset('active_mask', data=config.active_mask)
-    grp.create_dataset('snap_to_ant64', data=config.snap_to_ant64)
-    grp.create_dataset('ant64_to_snap', data=config.ant64_to_snap)
+    grp.create_dataset('antenna_ids', data=config.antenna_ids)
     grp.attrs['csv_path'] = config.csv_path
     grp.attrs['pos_ids'] = json.dumps(config.pos_ids)
     grp.attrs['n_active'] = config.n_active
 
 
 def _load_array64_config_group(grp):
-    """Load Array64Config from an HDF5 group."""
+    """Load Array64Config from an HDF5 group (v1.0 or v2.0)."""
     _, Array64Config, _ = _get_combined_weights_classes()
-    return Array64Config(
-        positions_enu=grp['positions_enu'][:],
-        active_mask=grp['active_mask'][:],
-        snap_to_ant64=grp['snap_to_ant64'][:],
-        ant64_to_snap=grp['ant64_to_snap'][:],
-        pos_ids=json.loads(grp.attrs['pos_ids']),
-        csv_path=grp.attrs.get('csv_path', ''),
-    )
+    return _array64_from_h5_group(grp, Array64Config)
 
 
 def save_combined_weights_hdf5(
@@ -718,12 +760,13 @@ def save_combined_weights_hdf5(
         f.create_dataset('frequencies_hz', data=weights.frequencies_hz)
         f.create_dataset('channel_flags', data=weights.flags)
 
-        # Root attributes
+        # Root attributes. n_antennas mirrors the SNAP slot count
+        # (n_snaps * n_adc — 72 on current 6×12 hardware).
         f.attrs['format_type'] = 'combined_complex64_snap_weights'
         f.attrs['version'] = '1.0'
         f.attrs['created_utc'] = datetime.now(timezone.utc).isoformat()
         f.attrs['n_beams'] = weights.n_beams
-        f.attrs['n_antennas'] = 64
+        f.attrs['n_antennas'] = len(weights.array_config.positions_enu)
         f.attrs['n_channels'] = weights.n_channels
         f.attrs['n_good_channels'] = weights.n_good_channels
         f.attrs['weights_dtype'] = str(weights.weights.dtype)

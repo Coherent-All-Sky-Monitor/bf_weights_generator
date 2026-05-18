@@ -1,17 +1,23 @@
 """
-SNAP beamformer weight generation for 64-antenna arrays.
+SNAP beamformer weight generation for the CASM array.
 
 This module generates int8-quantized stationary beamformer weights for SNAP
 hardware. It reads antenna layouts from CSV files and outputs weights in
 SNAP input order.
 
+The SNAP slot count is ``n_snaps * n_adc`` (6 × 12 = 72 for current CASM
+hardware). The class name ``Array64Config`` is historical; arrays are
+sized from the layout's per-slot vectors (positions, antenna_ids, …) and
+will scale automatically if the hardware grows.
+
 Key classes:
-- Array64Config: 64-slot antenna array loaded from CSV
+- Array64Config: per-SNAP-slot antenna array loaded from CSV
 - SnapWeightsGenerator: Computes int8 weights for SNAP beamformer
 - Int8StationaryWeights: Container for quantized weights
 """
 
 import numpy as np
+import pandas as pd
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 from pathlib import Path
@@ -44,179 +50,123 @@ TRANSIT_SURVEY_BEAMS = [
 @dataclass
 class Array64Config:
     """
-    64-slot antenna array configuration loaded from CSV.
+    Per-SNAP-slot antenna array configuration indexed by SNAP input.
 
-    The SNAP beamformer expects weights for 64 antenna inputs regardless of
-    how many antennas are actually installed. This class manages the mapping
-    between physical antenna positions and SNAP input indices.
+    The SNAP beamformer takes weights in F-engine order:
+    ``snap_input_idx = snap_id * n_adc + adc`` for ``n_snaps * n_adc``
+    inputs total (72 for the current 6 × 12 CASM hardware). This
+    dataclass holds one entry per SNAP input, with arrays sized to that
+    slot count and ``-1``/``False`` for unwired slots. There is no
+    separate "ant64" slot space — every index in this class is already a
+    SNAP input index.
+
+    The class name is retained for backwards-compat; the slot count is
+    *not* hard-coded to 64.
 
     Attributes
     ----------
     positions_enu : np.ndarray
-        (64, 3) array of ENU positions. Inactive slots have [0, 0, 0].
+        (n_slots, 3) ENU positions, indexed by snap_input_idx. Unwired
+        slots are [0, 0, 0].
     active_mask : np.ndarray
-        (64,) boolean array. True for slots with installed antennas.
-    snap_to_ant64 : np.ndarray
-        (64,) array mapping SNAP input index to ant64 slot.
-    ant64_to_snap : np.ndarray
-        (64,) array mapping ant64 slot to SNAP input index. -1 if inactive.
+        (n_slots,) bool, indexed by snap_input_idx. True iff the slot is
+        wired AND included in beamforming.
+    antenna_ids : np.ndarray
+        (n_slots,) int, indexed by snap_input_idx. Real antenna_id at
+        each slot, or -1 for unwired slots. The bridge to cal weights:
+        ``cal_aligned[i] = cal.weights[np.where(cal.ant_ids == antenna_ids[snap_idx])[0]]``.
     pos_ids : List[str]
-        Position IDs from CSV for each of the 64 slots ("" if inactive).
+        Human-facing position labels (e.g. "N21E1") per slot, "" if
+        unwired.
     csv_path : str
-        Path to the CSV file this was loaded from.
+        Provenance — path to the source CSV.
     """
     positions_enu: np.ndarray
     active_mask: np.ndarray
-    snap_to_ant64: np.ndarray
-    ant64_to_snap: np.ndarray
+    antenna_ids: np.ndarray
     pos_ids: List[str] = field(default_factory=list)
     csv_path: str = ""
 
     @classmethod
     def from_csv(cls, csv_path: str) -> 'Array64Config':
+        """Build from any layout CSV via :class:`AntennaMapping`.
+
+        Accepts either the canonical schema (``antenna_id``/``snap_id``/
+        ``adc``/``packet_index``) or the legacy ``bf_weights_generator``
+        fixture schema (``pos_id``/``snap_A``/``adc_A``/``ant64`` plus
+        ``x_east_m``/``y_north_m``/``z_up_m``). The legacy schema is
+        detected and column-renamed inside :meth:`AntennaMapping.load`.
         """
-        Parse antenna layout CSV and build 64-slot array configuration.
-
-        CSV must contain columns:
-        - ant64: slot index (0-63)
-        - x_east_m, y_north_m, z_up_m: ENU coordinates
-        - snap_A, adc_A: SNAP board and ADC channel for Pol A
-        - include_in_beamforming: boolean filter
-        - pos_type: must be 'antenna' to be included
-
-        Parameters
-        ----------
-        csv_path : str
-            Path to the antenna layout CSV file.
-
-        Returns
-        -------
-        Array64Config
-            Configured 64-slot array.
-        """
-        csv_path = str(csv_path)
-
-        # Initialize 64-slot arrays
-        positions_enu = np.zeros((64, 3), dtype=np.float64)
-        active_mask = np.zeros(64, dtype=bool)
-        snap_to_ant64 = np.full(64, -1, dtype=np.int32)
-        ant64_to_snap = np.full(64, -1, dtype=np.int32)
-        pos_ids = [""] * 64
-
-        with open(csv_path, 'r', newline='') as f:
-            reader = csv.DictReader(f)
-
-            for row in reader:
-                # Filter: only include antennas marked for beamforming
-                if row.get('pos_type', '').strip().lower() != 'antenna':
-                    continue
-                if row.get('include_in_beamforming', '').strip().lower() != 'true':
-                    continue
-
-                # Get ant64 slot index
-                ant64_str = row.get('ant64', '').strip()
-                if not ant64_str:
-                    continue
-                ant64_idx = int(float(ant64_str))
-                if ant64_idx < 0 or ant64_idx >= 64:
-                    continue
-
-                # Get position
-                x = float(row.get('x_east_m', 0))
-                y = float(row.get('y_north_m', 0))
-                z = float(row.get('z_up_m', 0))
-
-                positions_enu[ant64_idx] = [x, y, z]
-                active_mask[ant64_idx] = True
-                pos_ids[ant64_idx] = row.get('pos_id', '')
-
-                # Get SNAP mapping (Pol A)
-                snap_a_str = row.get('snap_A', '').strip()
-                adc_a_str = row.get('adc_A', '').strip()
-                if snap_a_str and adc_a_str:
-                    snap_board = int(float(snap_a_str))
-                    adc_channel = int(float(adc_a_str))
-                    snap_input_idx = snap_board * 12 + adc_channel
-
-                    if 0 <= snap_input_idx < 64:
-                        snap_to_ant64[snap_input_idx] = ant64_idx
-                        ant64_to_snap[ant64_idx] = snap_input_idx
-
-        return cls(
-            positions_enu=positions_enu,
-            active_mask=active_mask,
-            snap_to_ant64=snap_to_ant64,
-            ant64_to_snap=ant64_to_snap,
-            pos_ids=pos_ids,
-            csv_path=csv_path,
-        )
+        from casm_io.correlator.mapping import AntennaMapping
+        ant = AntennaMapping.load(str(csv_path))
+        out = cls.from_antenna_mapping(ant)
+        out.csv_path = str(csv_path)
+        return out
 
     @classmethod
     def from_antenna_mapping(cls, ant) -> "Array64Config":
-        """Build from a ``casm_io.AntennaMapping``.
+        """Build from a :class:`casm_io.AntennaMapping`.
 
-        The dated layout CSV that ``casm-build-layout`` writes uses a
-        different schema than ``from_csv`` expects (``antenna`` vs
-        ``ant64``, ``x``/``y``/``z`` vs ``x_east_m``/..., int 0/1 vs
-        the string ``"true"`` for ``include_in_beamforming``). Rather
-        than re-read the CSV and rename columns, accept the in-memory
-        AntennaMapping directly. Honours ``with_inactive`` overrides.
-
-        ``ant64`` slots are assigned in active-antenna order. ``snap``
-        and ``adc`` come from ``ant.snap_adc()`` (Pol A only — antennas
-        whose ``snap*12+adc`` falls outside [0, 64) are positioned but
-        not given a SNAP slot, same as ``from_csv``).
+        Uses :meth:`AntennaMapping.slot_table` (and its derived helpers
+        :meth:`positions_64` / :meth:`active_mask_64` /
+        :meth:`antenna_ids_64`) so the result is indexed by
+        ``snap_input_idx = snap_id * 12 + adc`` directly. Honours
+        ``with_inactive`` overrides.
         """
-        active = sorted(ant.active_antennas())
-        df = ant.dataframe
+        positions_enu = ant.positions_64()             # (n_slots, 3)
+        active_mask   = ant.active_mask_64()           # (n_slots,) bool
+        antenna_ids   = ant.antenna_ids_64()           # (n_slots,) int, -1 unwired
 
-        positions_enu = np.zeros((64, 3), dtype=np.float64)
-        active_mask = np.zeros(64, dtype=bool)
-        snap_to_ant64 = np.full(64, -1, dtype=np.int32)
-        ant64_to_snap = np.full(64, -1, dtype=np.int32)
-        pos_ids: List[str] = [""] * 64
-
-        for ant64_idx, aid in enumerate(active):
-            if ant64_idx >= 64:
-                break
-            row = df.loc[df["antenna_id"] == aid].iloc[0]
-            positions_enu[ant64_idx] = [
-                float(row["x_m"]), float(row["y_m"]), float(row["z_m"])
+        # Human-facing position labels per slot (e.g. "N21E1"). Pull
+        # from the slot_table when row/col columns exist, else fall
+        # back to "ANT<aid>" or "".
+        slots = ant.slot_table()
+        if "row" in slots.columns and "col" in slots.columns:
+            def _label(s):
+                aid = int(s["antenna_id"])
+                if aid < 0:
+                    return ""
+                r = s["row"] if pd.notna(s.get("row")) else ""
+                c = s["col"] if pd.notna(s.get("col")) else ""
+                return f"{r}{c}" if r and c else f"ANT{aid}"
+            pos_ids = [_label(slots.iloc[i]) for i in range(len(slots))]
+        else:
+            pos_ids = [
+                f"ANT{int(aid)}" if int(aid) >= 0 else ""
+                for aid in antenna_ids
             ]
-            active_mask[ant64_idx] = True
-            r = row.get("row", "") if "row" in df.columns else ""
-            c = row.get("col", "") if "col" in df.columns else ""
-            pos_ids[ant64_idx] = (f"{r}{c}" if r and c else f"ANT{aid}")
-
-            snap, adc = ant.snap_adc(aid)
-            snap_input_idx = int(snap) * 12 + int(adc)
-            if 0 <= snap_input_idx < 64:
-                snap_to_ant64[snap_input_idx] = ant64_idx
-                ant64_to_snap[ant64_idx] = snap_input_idx
 
         return cls(
             positions_enu=positions_enu,
             active_mask=active_mask,
-            snap_to_ant64=snap_to_ant64,
-            ant64_to_snap=ant64_to_snap,
+            antenna_ids=antenna_ids.astype(np.int32),
             pos_ids=pos_ids,
             csv_path="<from AntennaMapping>",
         )
 
     @property
     def n_active(self) -> int:
-        """Number of active (installed) antennas."""
+        """Number of active (installed and included) antennas."""
         return int(np.sum(self.active_mask))
 
     @property
     def active_indices(self) -> np.ndarray:
-        """Indices of active antenna slots (0-63)."""
+        """SNAP input indices (snap_input_idx values) of active antennas.
+
+        For a sparse layout this returns e.g. ``[0, 6, 8, 9, 13, ...]``
+        — the snap_input_idx values, NOT a sequential 0..N-1 range.
+        """
         return np.where(self.active_mask)[0]
 
     @property
     def active_positions(self) -> np.ndarray:
         """Positions of active antennas only, shape (n_active, 3)."""
         return self.positions_enu[self.active_mask]
+
+    @property
+    def active_antenna_ids(self) -> np.ndarray:
+        """Real antenna_id of each active slot (n_active,) int."""
+        return self.antenna_ids[self.active_mask]
 
     def to_array_config(self) -> ArrayConfig:
         """
@@ -236,7 +186,7 @@ class Array64Config:
         )
 
     def __repr__(self) -> str:
-        return (f"Array64Config(n_active={self.n_active}/64, "
+        return (f"Array64Config(n_active={self.n_active}/{len(self.positions_enu)}, "
                 f"csv='{Path(self.csv_path).name}')")
 
 
@@ -246,14 +196,15 @@ class Int8StationaryWeights:
     Container for int8-quantized stationary beamformer weights.
 
     The weights are stored in the format expected by SNAP hardware:
-    - Shape: (2, n_chan, 2, n_beams, 64) = (real/imag, chan, pol, beam, ant)
+    - Shape: (2, n_chan, 2, n_beams, n_slots) = (real/imag, chan, pol, beam, ant)
+      where ``n_slots = n_snaps * n_adc`` (72 for current 6×12 CASM hardware)
     - Antenna dimension is in SNAP input order
     - Channels are in descending frequency order (high-to-low, native SNAP order)
 
     Attributes
     ----------
     weights_int8 : np.ndarray
-        Quantized weights, shape (2, n_chan, 2, n_beams, 64).
+        Quantized weights, shape (2, n_chan, 2, n_beams, n_slots).
         First axis: 0=real, 1=imag.
     pointings : List[StationaryPointing]
         Beam pointing directions.
@@ -295,15 +246,15 @@ class Int8StationaryWeights:
         Returns
         -------
         np.ndarray
-            Complex weights, shape (n_beams, 64, n_chan).
+            Complex weights, shape (n_beams, n_slots, n_chan).
             Note: This is in SNAP order, channels reversed from original.
         """
         real = self.weights_int8[0].astype(np.float32) / self.scale_factor
         imag = self.weights_int8[1].astype(np.float32) / self.scale_factor
-        # Shape: (n_chan, 2, n_beams, 64) -> transpose to (n_beams, 64, n_chan)
+        # Shape: (n_chan, 2, n_beams, n_slots) -> (n_beams, n_slots, n_chan)
         # Take pol 0 since both pols are identical
         complex_weights = real[:, 0, :, :] + 1j * imag[:, 0, :, :]
-        # Transpose from (n_chan, n_beams, 64) to (n_beams, 64, n_chan)
+        # Transpose from (n_chan, n_beams, n_slots) to (n_beams, n_slots, n_chan)
         return complex_weights.transpose(1, 2, 0)
 
     def __repr__(self) -> str:
@@ -429,8 +380,10 @@ def load_calibration_weights(npz_path: str) -> CalibrationWeights:
             source=source,
         )
 
-    # NPZ path (legacy)
-    data = np.load(npz_path, allow_pickle=True)
+    # NPZ path (legacy). Disable pickle: every key consumed below
+    # (weights, flags, ant_ids, freqs_hz/freqs_mhz, ref_ant_id, source)
+    # is a plain ndarray or scalar, so pickle is never required.
+    data = np.load(npz_path, allow_pickle=False)
 
     weights = data['weights']
     flags = data['flags']
@@ -486,7 +439,8 @@ class SnapWeightsGenerator:
 
     This class wraps GeometricBeamformer to produce weights in the format
     expected by the SNAP beamformer:
-    - 64 antenna inputs (inactive = 0)
+    - n_slots antenna inputs (= n_snaps × n_adc, 72 for current CASM
+      6×12 hardware; inactive slots zero-filled)
     - Antenna ordering matches SNAP input order
     - Channels reversed (low-to-high frequency)
     - Quantized to int8
@@ -494,13 +448,14 @@ class SnapWeightsGenerator:
     Parameters
     ----------
     array_config : Array64Config
-        64-slot array configuration loaded from CSV. Used for computing
-        geometric weights (antenna positions).
+        SNAP-slot array configuration loaded from CSV (72 slots = 6 SNAPs
+        × 12 ADCs for current CASM hardware). Used for computing geometric
+        weights (antenna positions).
     freq_config : FrequencyConfig, optional
         Frequency configuration. Uses default CASM configuration if not specified.
     output_array_config : Array64Config, optional
         Array configuration for SNAP output ordering. If provided, the SNAP
-        reordering step uses this layout's snap_to_ant64 mapping instead of
+        reordering step uses this layout's ``antenna_ids`` mapping instead of
         array_config's. This is useful when the calibration data was taken with
         a different SNAP board assignment than the current one.
 
@@ -511,7 +466,7 @@ class SnapWeightsGenerator:
     >>> gen = SnapWeightsGenerator(array)
     >>> weights = gen.compute_int8_weights()  # Uses default transit survey beams
     >>> weights.shape
-    (2, 3072, 2, 8, 64)
+    (2, 3072, 2, 8, 72)
     """
 
     def __init__(
@@ -587,20 +542,31 @@ class SnapWeightsGenerator:
             cal_w = cal_weights.weights
             cal_flags = cal_weights.flags
 
-        # --- Antenna mapping: cal ant_ids (1-indexed) → ant64 (0-indexed) ---
+        # --- Antenna mapping: real antenna_id at each active SNAP slot
+        # → row index in cal_weights.weights ---
+        # active_indices yields snap_input_idx values (e.g. [0, 6, 8, ...]).
+        # antenna_ids[snap_idx] gives the real antenna_id at that slot.
+        # Match against cal_weights.ant_ids (real IDs) to find the cal row.
         active_indices = self.array_config.active_indices
         n_active = len(active_indices)
-        cal_ant64 = cal_weights.ant_ids - 1
+        ids_at_slot = self.array_config.antenna_ids
+        cal_ids = np.asarray(cal_weights.ant_ids).astype(int)
 
         cal_ant_map = np.full(n_active, -1, dtype=np.int32)
-        for i, ant64_idx in enumerate(active_indices):
-            matches = np.where(cal_ant64 == ant64_idx)[0]
+        for i, snap_idx in enumerate(active_indices):
+            aid = int(ids_at_slot[snap_idx])
+            matches = np.where(cal_ids == aid)[0]
             if len(matches) == 1:
                 cal_ant_map[i] = matches[0]
             elif len(matches) == 0:
                 raise ValueError(
-                    f"Active antenna ant64={ant64_idx} not found in cal weights "
-                    f"ant_ids={cal_weights.ant_ids}"
+                    f"Active antenna {aid} (snap_input_idx={snap_idx}) "
+                    f"not found in cal weights ant_ids={cal_ids.tolist()}"
+                )
+            else:
+                raise ValueError(
+                    f"Cal weights have {len(matches)} entries for "
+                    f"antenna_id={aid}; expected exactly one."
                 )
 
         # --- Combine: w_total = w_cal * w_geo ---
@@ -683,21 +649,17 @@ class SnapWeightsGenerator:
 
         n_beams = len(pointings)
         n_chan = self.freq_config.n_chan
+        n_slots = len(self.array_config.positions_enu)
 
-        # Step 2: Expand to 64 slots (inactive = 0)
-        weights_64 = np.zeros((n_beams, 64, n_chan), dtype=np.complex64)
+        # Step 2: Expand to n_slots SNAP-input slots (inactive = 0).
+        # active_indices already returns snap_input_idx values, so this
+        # writes the geometric weights directly into F-engine order — no
+        # separate reorder step needed. n_slots is the full CAsMan slot
+        # count (n_snaps * n_adc = 72 for the current 6×12 hardware).
+        weights_snap_order = np.zeros((n_beams, n_slots, n_chan), dtype=np.complex64)
         active_indices = self.array_config.active_indices
-        for i, ant64_idx in enumerate(active_indices):
-            weights_64[:, ant64_idx, :] = active_weights[:, i, :]
-
-        # Step 3: Reorder antennas to SNAP input order (using output layout)
-        weights_snap_order = np.zeros((n_beams, 64, n_chan), dtype=np.complex64)
-        snap_mapping = self.output_array_config.snap_to_ant64
-        for snap_idx in range(64):
-            ant64_idx = snap_mapping[snap_idx]
-            if ant64_idx >= 0:
-                weights_snap_order[:, snap_idx, :] = weights_64[:, ant64_idx, :]
-            # else: stays zero (inactive SNAP input)
+        for i, snap_idx in enumerate(active_indices):
+            weights_snap_order[:, snap_idx, :] = active_weights[:, i, :]
 
         # Step 5: Quantize to int8
         real_scaled = np.round(weights_snap_order.real * scale_factor)
@@ -705,19 +667,19 @@ class SnapWeightsGenerator:
         real_int8 = np.clip(real_scaled, -128, 127).astype(np.int8)
         imag_int8 = np.clip(imag_scaled, -128, 127).astype(np.int8)
 
-        # Step 6: Reshape to (2, n_chan, n_beams, 64) and add pol dimension
-        # Current shape: (n_beams, 64, n_chan)
-        # Target shape: (2, n_chan, 2, n_beams, 64)
-        real_reshaped = real_int8.transpose(2, 0, 1)  # (n_chan, n_beams, 64)
-        imag_reshaped = imag_int8.transpose(2, 0, 1)  # (n_chan, n_beams, 64)
+        # Step 6: Reshape to (2, n_chan, n_beams, n_slots) and add pol dim
+        # Current shape: (n_beams, n_slots, n_chan)
+        # Target shape: (2, n_chan, 2, n_beams, n_slots)
+        real_reshaped = real_int8.transpose(2, 0, 1)  # (n_chan, n_beams, n_slots)
+        imag_reshaped = imag_int8.transpose(2, 0, 1)  # (n_chan, n_beams, n_slots)
 
         # Add polarization dimension (duplicate for both pols)
-        # Shape: (n_chan, 2, n_beams, 64)
+        # Shape: (n_chan, 2, n_beams, n_slots)
         real_with_pol = np.stack([real_reshaped, real_reshaped], axis=1)
         imag_with_pol = np.stack([imag_reshaped, imag_reshaped], axis=1)
 
         # Stack real and imag as first dimension
-        # Shape: (2, n_chan, 2, n_beams, 64)
+        # Shape: (2, n_chan, 2, n_beams, n_slots)
         weights_int8 = np.stack([real_with_pol, imag_with_pol], axis=0)
 
         # Frequencies in native descending order (high-to-low, matching SNAP hardware)
@@ -750,7 +712,8 @@ class CombinedWeights:
     Attributes
     ----------
     weights : np.ndarray
-        (n_beams, 64, n_chan) complex64 weights in SNAP input order.
+        (n_beams, n_slots, n_chan) complex64 weights in SNAP input order.
+        ``n_slots`` = ``n_snaps * n_adc`` (72 for current 6×12 hardware).
     frequencies_hz : np.ndarray
         (n_chan,) float64 channel frequencies in Hz.
     flags : np.ndarray
@@ -796,6 +759,49 @@ class CombinedWeights:
             f"CombinedWeights(n_beams={self.n_beams}, n_chan={self.n_channels}, "
             f"good_chan={self.n_good_channels}, {cal_str}, "
             f"freq_order={self.freq_order!r})"
+        )
+
+    def to_int8(self, scale_factor: float = 127.0) -> "Int8StationaryWeights":
+        """Quantize the complex64 weights to int8 in SNAP F-engine layout.
+
+        Reshapes ``(n_beams, n_slots, n_chan)`` complex64 to the F-engine
+        wire format ``(2, n_chan, 2, n_beams, n_slots)`` int8 — axes are
+        ``(real/imag, channel, polarization, beam, snap_input_idx)``.
+        ``n_slots = n_snaps * n_adc`` (72 for current 6×12 CASM hardware).
+        Both polarizations are populated identically; the SNAP F-engine
+        consumes pol A and pol B from the same DADA stream.
+
+        Channels are stored in descending frequency order (the SNAP
+        native order). If ``self.freq_order == "ascending"`` the
+        weights are flipped along the channel axis on the way out so
+        the output file is always SNAP-native.
+        """
+        w = self.weights                              # (n_beams, n_slots, n_chan)
+        if self.freq_order == "ascending":
+            w = w[:, :, ::-1]
+        real = np.clip(np.round(w.real * scale_factor), -128, 127).astype(np.int8)
+        imag = np.clip(np.round(w.imag * scale_factor), -128, 127).astype(np.int8)
+        # (n_beams, n_slots, n_chan) -> (n_chan, n_beams, n_slots)
+        real_t = real.transpose(2, 0, 1)
+        imag_t = imag.transpose(2, 0, 1)
+        # Add pol axis (duplicate A/B): (n_chan, 2, n_beams, n_slots)
+        real_with_pol = np.stack([real_t, real_t], axis=1)
+        imag_with_pol = np.stack([imag_t, imag_t], axis=1)
+        # Stack real/imag: (2, n_chan, 2, n_beams, 64)
+        weights_int8 = np.stack([real_with_pol, imag_with_pol], axis=0)
+
+        # Frequencies in descending order (native SNAP).
+        freqs = self.frequencies_hz
+        if self.freq_order == "ascending":
+            freqs = freqs[::-1]
+
+        return Int8StationaryWeights(
+            weights_int8=weights_int8,
+            pointings=self.pointings,
+            frequencies_hz=freqs,
+            array_config=self.array_config,
+            freq_config=self.freq_config,
+            scale_factor=scale_factor,
         )
 
 
@@ -867,19 +873,15 @@ def generate_combined_weights(
     n_beams = len(pointings)
     n_chan = freq_config.n_chan
     active_indices = array_config.active_indices
+    n_slots = len(array_config.positions_enu)
 
-    # Step 3: expand to 64 slots
-    weights_64 = np.zeros((n_beams, 64, n_chan), dtype=np.complex64)
-    for i, ant64_idx in enumerate(active_indices):
-        weights_64[:, ant64_idx, :] = active_weights[:, i, :]
-
-    # Step 4: reorder to SNAP input order
-    weights_snap = np.zeros((n_beams, 64, n_chan), dtype=np.complex64)
-    snap_mapping = output_array_config.snap_to_ant64
-    for snap_idx in range(64):
-        ant64_idx = snap_mapping[snap_idx]
-        if ant64_idx >= 0:
-            weights_snap[:, snap_idx, :] = weights_64[:, ant64_idx, :]
+    # Step 3: expand to n_slots SNAP-input slots (active_indices ARE
+    # snap_input_idx values, so no separate reorder pass needed).
+    # n_slots is the full CAsMan slot count (n_snaps * n_adc = 72 for
+    # the current 6×12 hardware).
+    weights_snap = np.zeros((n_beams, n_slots, n_chan), dtype=np.complex64)
+    for i, snap_idx in enumerate(active_indices):
+        weights_snap[:, snap_idx, :] = active_weights[:, i, :]
 
     # Step 5: build frequencies (descending, matching geo convention)
     frequencies_hz = freq_config.get_frequencies_hz()  # descending
