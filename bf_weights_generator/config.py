@@ -45,9 +45,17 @@ class FrequencyConfig:
     """
     Configuration for CASM frequency channels.
 
-    The default configuration uses 3072 channels from a 4096-channel system
-    with 125 MHz total bandwidth. Frequencies are computed from the high end
-    of the voltage band going downward.
+    .. note::
+       The default constructor pins the **legacy** ``layout_32ant``
+       (pre-Jan-27-2026) band: channel-0 upper edge at 468.75 MHz. This
+       preserves bit-for-bit reproducibility of historical int8 weights.
+       For the current ``layout_64ant`` (post-Jan-27-2026) band, use
+       :meth:`layout_64ant` or :meth:`from_format`.
+
+    ``freq_end_voltage_mhz`` is stored as the *upper edge* of channel 0;
+    the channel-0 *center* is ``freq_end_voltage_mhz - chan_bw_mhz/2``.
+
+    To pin to a specific casm_io format, use :meth:`from_format`.
 
     Attributes
     ----------
@@ -58,12 +66,67 @@ class FrequencyConfig:
     total_n_chan : int
         Total number of channels in the system (default: 4096)
     freq_end_voltage_mhz : float
-        Upper frequency edge of the voltage data in MHz (default: 468.75)
+        Upper frequency edge of the voltage data in MHz. Default
+        ``468.75`` matches the legacy layout_32ant band. Use
+        :meth:`layout_64ant` (or :meth:`from_format`) for the
+        post-Jan-27-2026 band where channel 0's center is 484.375 MHz.
     """
     n_chan: int = 3072
     total_bw_mhz: float = 125.0
     total_n_chan: int = 4096
+    # Default = legacy layout_32ant band upper edge (468.75 MHz).
+    # The current layout_64ant band lives at 484.375 + chan_bw/2; use
+    # ``FrequencyConfig.layout_64ant()`` to opt in.
     freq_end_voltage_mhz: float = 468.75
+
+    @classmethod
+    def layout_64ant(cls) -> "FrequencyConfig":
+        """Frequency config for the post-Jan-27-2026 ``layout_64ant`` band.
+
+        Channel-0 center = 484.375 MHz; ``freq_end_voltage_mhz`` is the
+        upper edge at ``484.375 + (125.0 / 4096) / 2``. ``n_chan``,
+        ``total_bw_mhz``, and ``total_n_chan`` keep their canonical
+        defaults (3072 / 125.0 / 4096).
+        """
+        return cls(
+            n_chan=3072,
+            total_bw_mhz=125.0,
+            total_n_chan=4096,
+            freq_end_voltage_mhz=484.375 + (125.0 / 4096.0) / 2.0,
+        )
+
+    @classmethod
+    def from_format(cls, fmt) -> "FrequencyConfig":
+        """Build a FrequencyConfig from a casm_io ``VisibilityFormat``.
+
+        Pulls ``freq_top_mhz`` (= channel-0 center) and ``chan_bw_mhz``
+        from the format and computes the matching ``freq_end_voltage_mhz``.
+        ``total_bw_mhz`` / ``total_n_chan`` are derived under the
+        assumption of a 4096-channel voltage system; pass a custom
+        ``total_n_chan`` only if the F-engine ever runs at a different
+        FFT length.
+
+        Parameters
+        ----------
+        fmt : ``casm_io.VisibilityFormat`` or layout-name string
+            If a string, resolved via ``casm_io.load_format``.
+        """
+        if isinstance(fmt, str):
+            from casm_io.correlator import load_format
+            fmt = load_format(fmt)
+        n_chan = int(fmt.nchan)
+        chan_bw_mhz = float(fmt.chan_bw_mhz)
+        total_n_chan = 4096
+        total_bw_mhz = chan_bw_mhz * total_n_chan
+        # fmt.freq_top_mhz is the channel-0 *center*; FrequencyConfig
+        # stores the channel-0 *upper edge* in freq_end_voltage_mhz.
+        freq_end_voltage_mhz = float(fmt.freq_top_mhz) + chan_bw_mhz / 2.0
+        return cls(
+            n_chan=n_chan,
+            total_bw_mhz=total_bw_mhz,
+            total_n_chan=total_n_chan,
+            freq_end_voltage_mhz=freq_end_voltage_mhz,
+        )
 
     @property
     def chan_bw_mhz(self) -> float:
