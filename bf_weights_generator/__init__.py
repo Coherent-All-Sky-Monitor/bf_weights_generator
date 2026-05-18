@@ -70,7 +70,7 @@ from typing import TypedDict
 import numpy as np
 
 
-__version__ = "0.3.0"
+__version__ = "1.0.0"
 __author__ = "CASM Team"
 
 
