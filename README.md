@@ -1,166 +1,109 @@
 # bf_weights_generator
 
-Generate beamformer weights for the CASM phased array at OVRO. Takes
-calibration weights from `casm-svd-calibrate` and produces SNAP-ready
-weight files with geometric steering and delay calibration combined.
+Generates SNAP-ready int8-quantized beamforming weights and incoherent-beam (IB)
+masks for the CASM phased array at OVRO. Takes calibration weights from
+`casm_calibrator` and antenna layout from `casm_io`, then writes `.h5` weight
+files consumed by the online beamformer (hella / bfcorr).
 
-## Install
-
-```bash
-source ~/software/dev/casm_venvs/casm_refactor_env/bin/activate
-cd /home/casm/software/dev/bf_weights_generator
-pip install -e ".[full]"
-```
-
-## Concepts
-
-- **`Array64Config`** — Per-SNAP-slot antenna layout. Despite the name,
-  arrays are sized to `n_snaps * n_adc` (currently `6 * 12 = 72`) so
-  every slot in real CAsMan hardware is addressable. The class exposes
-  `positions_enu`, `active_mask`, `antenna_ids` and the derived
-  `active_indices` / `active_positions` / `n_active`. Build via
-  `Array64Config.from_csv(path)` or `Array64Config.from_antenna_mapping(ant)`
-  (where `ant` is a `casm_io.AntennaMapping`).
-- **`FrequencyConfig`** — 3072 channels of a 4096-channel voltage system,
-  125 MHz bandwidth. **The default tracks the legacy `layout_32ant`
-  band (channel-0 upper edge 468.75 MHz)** for reproducibility of
-  historical weights. Use `FrequencyConfig.layout_64ant()` for the
-  post-Jan-27-2026 band (channel-0 center 484.375 MHz), or
-  `FrequencyConfig.from_format(fmt)` to pin to a casm_io
-  `VisibilityFormat`.
-- **`CalibrationWeights`** — input from `casm_calibrator`; ant-aligned
-  via `ant_ids`.
-- **`Int8StationaryWeights`** — output container. Quantized weights of
-  shape `(2, n_chan, 2, n_beams, n_slots)` = (real/imag, chan, pol,
-  beam, snap_input_idx); always written in descending-frequency SNAP
-  native order.
-- **`CombinedWeights`** — complex64 container preserved before the int8
-  quantization step (shape `(n_beams, n_slots, n_chan)`).
-- **`StationaryPointing`** — fixed (alt, az) beam direction.
-- **`generate_beam_grid_altaz(spacing_deg=...)`** — returns
-  `List[StationaryPointing]` tiling the sky on an alt-az grid.
-
-## How to generate beamforming weights
-
-### 1. Generate calibration weights (casm_calibrator)
+## Installation
 
 ```bash
-casm-svd-calibrate \
-  --data-dir /mnt/nvme3/data/casm/visibilities_64ant/ \
-  --obs 2026-03-20-05:55:45 \
-  --source sun \
-  --layout ~/software/dev/antenna_layouts/antenna_layout_mar21.csv \
-  --ref-ant 3 \
-  --time-start '2026-03-21 10:00:00' --time-end '2026-03-21 15:00:00' --time-tz US/Pacific \
-  --output cal_weights.npz \
-  --plots cal_diagnostics.pdf
+source ~/software/dev/casm_venvs/casm_offline_env/bin/activate
+pip install -e "/home/casm/software/dev/bf_weights_generator[full]"
 ```
 
-### 2. Generate the int8 weight file (this repo)
+`[full]` pulls in `h5py` and `astropy`. Both are required for production use.
 
-Two equivalent entry points:
+## Primary example
 
 ```python
-import numpy as np
 from bf_weights_generator import (
-    Array64Config,
-    FrequencyConfig,
-    SnapWeightsGenerator,
-    StationaryPointing,
-    generate_beam_grid_altaz,
-    load_calibration_weights,
+    Array64Config, FrequencyConfig, generate_beam_grid_altaz,
+    generate_combined_weights, load_calibration_weights,
     save_int8_weights_hdf5,
 )
+from casm_io.correlator import AntennaMapping
 
-# Layout + cal
-layout = Array64Config.from_csv("antenna_layout_mar21.csv")
-cal    = load_calibration_weights("cal_weights.npz")
-freq   = FrequencyConfig.layout_64ant()   # post-Jan-27-2026 band
+# No path -> the canonical $CASM_LAYOUT_DIR/current layout.
+ant = AntennaMapping.load().with_inactive([3])
+array_cfg = Array64Config.from_antenna_mapping(ant)
+freq_cfg = FrequencyConfig.layout_64ant()          # recommended for current band
 
-# 256-beam alt-az grid
-pointings = generate_beam_grid_altaz(spacing_deg=4.0)
+cal = load_calibration_weights("/path/to/cal.h5")  # casm_calibrator output
 
-# Int8 weights, ready for SNAP firmware
-gen = SnapWeightsGenerator(layout, freq_config=freq)
-int8 = gen.compute_int8_weights(pointings=pointings, cal_weights=cal)
-
-save_int8_weights_hdf5(int8, "weights_alt_az.h5")
-```
-
-Or, if you want the intermediate complex64 representation:
-
-```python
-from bf_weights_generator import (
-    generate_combined_weights,
-    save_combined_weights_hdf5,
-)
-
+beams = generate_beam_grid_altaz(spacing_deg=4.0)  # 4° default recommended
 combined = generate_combined_weights(
-    pointing=pointings,
-    array_config=layout,
+    pointing=beams,
+    array_config=array_cfg,
     cal_weights=cal,
-    freq_config=freq,
-    freq_order="descending",   # or "ascending"; default descending = SNAP-native
+    freq_config=freq_cfg,
+    freq_order="descending",                       # required for CASM native order
 )
-save_combined_weights_hdf5(combined, "combined.h5", overwrite=True)
-
-# When ready for hardware, quantize:
-int8 = combined.to_int8()
-save_int8_weights_hdf5(int8, "weights_alt_az.h5", overwrite=True)
+weights_int8 = combined.to_int8()
+save_int8_weights_hdf5(weights_int8, "/tmp/weights.h5", overwrite=False)
 ```
 
-### 3. Saved HDF5 schema (`save_int8_weights_hdf5`)
+## Key concepts
 
-Root attributes:
+**`Array64Config`** holds 72 slots (6 SNAPs x 12 ADCs = `n_snaps * n_adc`). The
+class name is a legacy artefact; slot count is never hard-coded. Size all
+allocations from `len(array_config.positions_enu)`. Build via
+`Array64Config.from_antenna_mapping(ant)`, not manual construction.
 
-| key | meaning |
-|---|---|
-| `format_type` | `"int8_snap_weights"` |
-| `version` | `"2.0"` (current schema) |
-| `n_beams`, `n_channels`, `n_pol`, `n_antennas` | mirror the array shape |
-| `scale_factor` | int8 scale (default 127.0) |
-| `created_utc` | ISO timestamp |
+**`FrequencyConfig`** defaults to the legacy `layout_32ant` band (channel-0
+upper edge 468.75 MHz). This default is frozen for reproducibility of historical
+weights. For the current `layout_64ant` (post-Jan-27-2026) band, use
+`FrequencyConfig.layout_64ant()` explicitly.
 
-Datasets:
+**`freq_order="descending"` is required** in `generate_combined_weights` to match
+CASM-native channel order. Ascending output is byte-different and breaks bit-exact
+reproduction of deployed weights.
 
-| path | shape | dtype | notes |
-|---|---|---|---|
-| `weights_int8` | `(2, n_chan, 2, n_beams, n_slots)` | int8 | real/imag, chan, pol, beam, snap_input_idx |
-| `frequencies_hz` | `(n_chan,)` | float64 | descending |
-| `pointings/alt_deg`, `pointings/az_deg` | `(n_beams,)` | float64 | with JSON `names` attribute |
-| `array_config/positions_enu` | `(n_slots, 3)` | float64 |
-| `array_config/active_mask` | `(n_slots,)` | bool |
-| `array_config/antenna_ids` | `(n_slots,)` | int32 | v2.0 (replaces v1.0 `snap_to_ant64`/`ant64_to_snap` reorder pair) |
+**Two distinct scale numbers exist; do not conflate them.** The HDF5 attribute
+`scale_factor=127` is the int8 quantization normalizer. The DADA header `SCALE`
+written at FIFO upload time is 32 (CB) or 8 (IB). See
+[docs/int8_weights.md](docs/int8_weights.md) for the full derivation.
 
-The v1.0 reader path still loads files written with `snap_to_ant64`;
-the slot count is taken from the dataset length, so any future hardware
-expansion past 64 slots loads correctly too.
+## Module overview
+
+| Module | Purpose |
+|--------|---------|
+| `snap_weights.py` | `Array64Config`, `SnapWeightsGenerator`, `Int8StationaryWeights`, `CombinedWeights`, `CalibrationWeights`, `generate_combined_weights` |
+| `config.py` | `FrequencyConfig`, `ArrayConfig`, observatory constants, `compute_beam_fwhm` |
+| `weights.py` | `GeometricBeamformer`, `StationaryPointing`, `generate_beam_grid_altaz` |
+| `io.py` | `save_int8_weights_hdf5`, `load_int8_weights_hdf5`, `save_combined_weights_hdf5`, `load_combined_weights_hdf5` |
+| `coordinates.py` | LST, direction cosines, geometric delay utilities |
+| `deploy_bf_weights.py` | DADA-file generation and FIFO upload for the live pipeline |
 
 ## CLI commands
 
-### `casm-bf-weights` — read / inspect
-
 ```bash
-casm-bf-weights weights.h5                # summary
-casm-bf-weights weights.h5 --list-beams   # all beam pointings
-casm-bf-weights weights.h5 --beam 42      # detail for one beam
-casm-bf-weights weights.h5 --info         # full metadata dump
+casm-bf-weights weights.h5               # summary inspection
+casm-bf-weights weights.h5 --list-beams  # all beam pointings
+casm-bf-weights weights.h5 --beam 42     # one beam detail
+casm-bf-plotter weights.h5 -o beams.png  # sky map
+casm-bf-inspect weights.h5               # full metadata dump
 ```
 
-### `casm-bf-plotter` — sky map
+## Detailed documentation
 
-```bash
-casm-bf-plotter weights.h5 -o beam_layout.png
-casm-bf-plotter weights.h5 --freq 400e6 -o beams_400mhz.png
-```
+| Topic | File |
+|-------|------|
+| Array64Config, FrequencyConfig | [docs/array_and_frequency_config.md](docs/array_and_frequency_config.md) |
+| Beam grid generation, StationaryPointing | [docs/beam_grid.md](docs/beam_grid.md) |
+| Int8 weights, HDF5 schema, two-scale clarification | [docs/int8_weights.md](docs/int8_weights.md) |
+| IB binary mask format and FIFO upload | [docs/ib_weights.md](docs/ib_weights.md) |
+| Common workflows and recipes | [docs/recipes.md](docs/recipes.md) |
 
 ## Testing
 
 ```bash
 pytest tests/ -v
+# 95 pass, 12 skip (skips require optional voltage-data fixtures)
 ```
 
-## Detailed API reference
+## Repository boundary
 
-See [docs/api_reference.md](docs/api_reference.md) for the full Python
-API, output formats, CSV layout spec, and weight file structure.
+- **Consumes**: `CalibrationWeights` from `casm_calibrator`; antenna layout via `casm_io.AntennaMapping`
+- **Produces**: `.h5` weight files for hella / bfcorr; FIFO upload via `deploy_bf_weights.py`
+- **Does not**: perform SVD calibration, apply RFI masks, or manage the deployment FIFO lifecycle
