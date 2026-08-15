@@ -51,7 +51,32 @@ casm-corr1 and casm-corr2.
 ### DADA file output
 
 Local DADA files are written as `direct.dada.{0..5}` (CB) or
-`direct_ib.dada.{0..5}` (IB) in the output directory.
+`direct_ib.dada.{0..5}` (IB) in the output directory. These are staging names;
+they are NOT the names bfcorr loads (see below).
+
+### Restart defaults (`--save-defaults`)
+
+bfcorr loads both CB and IB restart defaults from the SAME directory,
+`/data/casm/default_weights_64ant_512beam`, appending `.{stream}` to the
+basenames configured in `medusa_antenna.cfg`
+(`BFCORR_DEFAULT_BF_WEIGHTS` / `BFCORR_DEFAULT_INCOH_WEIGHTS`):
+
+```
+/data/casm/default_weights_64ant_512beam/direct.dada.{0..5}   CB
+/data/casm/default_weights_64ant_512beam/incoh.dada.{0..5}    IB
+```
+
+`--save-defaults` scps the staged files to exactly those paths (renaming
+`direct_ib.dada.N` -> `incoh.dada.N`), verifies the remote size after each
+copy, and **aborts with a non-zero exit on any failure**. There is no separate
+IB defaults directory. Fixed 2026-08-14: earlier versions wrote IB defaults to
+`/data/casm/default_ib_weights_64ant/direct_ib.dada.N`, a path nothing reads,
+and only printed a message when the copy failed — so operators had to place
+`incoh.dada.N` by hand. That manual step is no longer needed.
+
+If you run `--save-defaults` without `--ib-weights`, only the CB defaults are
+refreshed and the script says so; the IB defaults on the corr machines stay as
+they were.
 
 ### Usage
 
@@ -79,7 +104,7 @@ python bf_weights_generator/deploy_bf_weights.py weights.h5 --upload --dry-run
 |------|---------|-------|
 | `--output-dir` | `.` | Directory for local DADA files |
 | `--upload` | off | Write to FIFOs on corr1/corr2 |
-| `--save-defaults` | off | Copy to `/data/casm/default_weights_64ant_512beam/` on both machines |
+| `--save-defaults` | off | Copy to `/data/casm/default_weights_64ant_512beam/` on both machines as `direct.dada.N` (CB) and `incoh.dada.N` (IB); exits non-zero if any copy fails |
 | `--utc-start` | current time | Apply immediately if omitted |
 | `--scale` | **32** | DADA `SCALE` header value. Use 32 for CB, 8 for IB. |
 | `--streams` | `0,1,2,3,4,5` | Comma-separated subband IDs |
