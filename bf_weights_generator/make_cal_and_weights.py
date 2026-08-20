@@ -1291,7 +1291,9 @@ def run(params: RecipeParams):
         out["weights_file"] = weights_file
         verify(params, weights_file, cal_file, grid_meta, report)
         print_operator_commands(params, weights_file)
-    elif not params.cal_path:
+    else:
+        # No weights to verify, but the cal itself still has to be sound.
+        print("\n[verify]", flush=True)
         check_cal_subbands(params, cal_file, report)
 
     # The products exist and are verified at this point: write the report
